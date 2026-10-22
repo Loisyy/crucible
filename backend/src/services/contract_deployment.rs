@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -95,6 +95,7 @@ impl ContractDeploymentService {
     }
 
     /// Coordinate contract deployment across multiple networks in a single request.
+    /// Uses PostgreSQL savepoints to ensure transactional consistency across all stages.
     pub async fn create_multi_network_deployment(
         &self,
         request: MultiNetworkDeploymentRequest,
@@ -119,11 +120,30 @@ impl ContractDeploymentService {
 
         let deployment_id = Uuid::new_v4().to_string();
         let mut results = Vec::new();
+        
+        // Start a transaction for the entire multi-network deployment
+        let mut tx = self.db.begin().await
+            .map_err(|e| AppError::ValidationError(format!("Transaction start failed: {}", e)))?;
 
         for network in &request.networks {
             if !matches!(network.as_str(), "mainnet" | "testnet" | "futurenet" | "sandbox") {
+                // Rollback on invalid network
+                let _ = tx.rollback().await;
                 return Err(AppError::ValidationError(format!(
                     "unsupported network '{network}', must be mainnet, testnet, futurenet, or sandbox"
+                )));
+            }
+
+            // Create savepoint for each network stage
+            let savepoint = format!("network_{}", network.replace('-', "_"));
+            if let Err(e) = sqlx::query(&format!("SAVEPOINT {}", savepoint))
+                .execute(&mut *tx)
+                .await
+            {
+                let _ = tx.rollback().await;
+                return Err(AppError::ValidationError(format!(
+                    "Failed to create savepoint for {}: {}",
+                    network, e
                 )));
             }
 
@@ -140,12 +160,45 @@ impl ContractDeploymentService {
                 format!("tx-{}-{}", network, Uuid::new_v4().to_string().replace('-', ""))
             };
 
+            // Attempt to persist deployment record in transaction
+            if let Err(e) = sqlx::query(
+                "INSERT INTO multi_network_deployments (deployment_id, network, contract_id, version, status, tx_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6)"
+            )
+            .bind(&deployment_id)
+            .bind(network)
+            .bind(&contract_id_deployed)
+            .bind(&request.version)
+            .bind(&status)
+            .bind(&transaction_hash)
+            .execute(&mut *tx)
+            .await
+            {
+                // Rollback to savepoint on error
+                let _ = sqlx::query(&format!("ROLLBACK TO {}", savepoint))
+                    .execute(&mut *tx)
+                    .await;
+                let _ = tx.rollback().await;
+                return Err(AppError::ValidationError(format!(
+                    "Failed to insert deployment for {}: {}",
+                    network, e
+                )));
+            }
+
             results.push(NetworkDeploymentResult {
                 network: network.clone(),
                 status,
                 contract_id_deployed,
                 transaction_hash,
             });
+        }
+
+        // Commit entire transaction if all networks succeeded
+        if let Err(e) = tx.commit().await {
+            return Err(AppError::ValidationError(format!(
+                "Transaction commit failed: {}",
+                e
+            )));
         }
 
         let overall_status = if request.dry_run {
