@@ -124,17 +124,32 @@ impl CacheInvalidationManager {
     pub async fn invalidate_pattern(&self, pattern: &str) -> Result<(), anyhow::Error> {
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
         
-        // Get all keys matching the pattern
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(pattern)
-            .query_async(&mut conn)
-            .await?;
+        // Use SCAN iteration instead of KEYS to avoid blocking the event loop
+        let mut cursor = 0u64;
+        let mut deleted_count = 0;
         
-        if !keys.is_empty() {
-            self.invalidate_keys(keys.clone()).await?;
-            info!(pattern = %pattern, count = keys.len(), "Invalidated keys by pattern");
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await?;
+            
+            if !keys.is_empty() {
+                self.invalidate_keys(keys.clone()).await?;
+                deleted_count += keys.len();
+            }
+            
+            cursor = new_cursor;
+            if cursor == 0 {
+                break;
+            }
         }
         
+        info!(pattern = %pattern, count = deleted_count, "Invalidated keys by pattern");
         Ok(())
     }
 
@@ -301,14 +316,27 @@ impl CacheInvalidationManager {
         for pattern in &patterns {
             let mut conn = redis_client.get_multiplexed_async_connection().await?;
             
-            // Get all keys matching the pattern
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg(pattern)
-                .query_async(&mut conn)
-                .await?;
+            // Use SCAN iteration instead of KEYS to avoid blocking the event loop
+            let mut cursor = 0u64;
             
-            if !keys.is_empty() {
-                Self::invalidate_keys_impl(redis_client, keys).await?;
+            loop {
+                let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(pattern)
+                    .arg("COUNT")
+                    .arg(100)
+                    .query_async(&mut conn)
+                    .await?;
+                
+                if !keys.is_empty() {
+                    Self::invalidate_keys_impl(redis_client, keys).await?;
+                }
+                
+                cursor = new_cursor;
+                if cursor == 0 {
+                    break;
+                }
             }
         }
         Ok(())
