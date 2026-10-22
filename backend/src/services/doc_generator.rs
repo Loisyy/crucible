@@ -4,6 +4,19 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+/// Sanitizes HTML content to prevent XSS attacks
+/// Uses a conservative allowlist approach - only allows safe tags
+fn sanitize_html(input: &str) -> String {
+    // Use a simple HTML escaping for documentation content
+    // This prevents any HTML/JavaScript from being interpreted
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamDoc {
     pub name: String,
@@ -73,7 +86,8 @@ impl DocGeneratorService {
                 if !fn_name.is_empty() {
                     functions.push(FunctionDoc {
                         name: fn_name,
-                        description: pending_doc.trim().to_string(),
+                        // Sanitize description to prevent XSS in OpenAPI docs
+                        description: sanitize_html(pending_doc.trim()),
                         params: vec![],
                         returns: "unknown".to_string(),
                         visibility: if trimmed.starts_with("pub") {
@@ -95,14 +109,16 @@ impl DocGeneratorService {
                 if !event_name.is_empty() {
                     events.push(EventDoc {
                         name: event_name,
-                        description: pending_doc.trim().to_string(),
+                        // Sanitize event description to prevent XSS
+                        description: sanitize_html(pending_doc.trim()),
                         fields: vec![],
                     });
                 }
                 pending_doc.clear();
             } else if !trimmed.is_empty() {
                 if description.is_empty() && !pending_doc.is_empty() {
-                    description = pending_doc.trim().to_string();
+                    // Sanitize contract description
+                    description = sanitize_html(pending_doc.trim());
                 }
                 pending_doc.clear();
             }
@@ -121,20 +137,21 @@ impl DocGeneratorService {
     pub fn generate_markdown(&self, doc: &ContractDoc) -> String {
         let mut md = format!("# {}\n\n", doc.contract_name);
         if !doc.description.is_empty() {
-            md.push_str(&format!("{}", doc.description));
+            // Markdown already sanitized from generate(), but double-sanitize for safety
+            md.push_str(&format!("{}", sanitize_html(&doc.description)));
             md.push_str("\n\n");
         }
         if !doc.functions.is_empty() {
             md.push_str("## Functions\n\n");
             for f in &doc.functions {
-                md.push_str(&format!("### `{}`\n\n{}", f.name, f.description));
+                md.push_str(&format!("### `{}`\n\n{}", f.name, sanitize_html(&f.description)));
                 md.push_str("\n\n");
             }
         }
         if !doc.events.is_empty() {
             md.push_str("## Events\n\n");
             for e in &doc.events {
-                md.push_str(&format!("### `{}`\n\n{}", e.name, e.description));
+                md.push_str(&format!("### `{}`\n\n{}", e.name, sanitize_html(&e.description)));
                 md.push_str("\n\n");
             }
         }
@@ -143,5 +160,59 @@ impl DocGeneratorService {
 
     pub fn generate_json(&self, doc: &ContractDoc) -> serde_json::Value {
         serde_json::to_value(doc).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_html_escapes_script_tags() {
+        let malicious = "<script>alert('XSS')</script>";
+        let sanitized = sanitize_html(malicious);
+        assert_eq!(sanitized, "&lt;script&gt;alert(&#x27;XSS&#x27;)&lt;/script&gt;");
+        assert!(!sanitized.contains("<script>"));
+    }
+
+    #[test]
+    fn test_sanitize_html_escapes_event_handlers() {
+        let malicious = "<img src=x onerror=\"alert('XSS')\">";
+        let sanitized = sanitize_html(malicious);
+        assert!(!sanitized.contains("onerror="));
+        assert!(sanitized.contains("&lt;"));
+    }
+
+    #[test]
+    fn test_sanitize_html_escapes_entities() {
+        let input = "Normal & safe <content>";
+        let sanitized = sanitize_html(input);
+        assert_eq!(sanitized, "Normal &amp; safe &lt;content&gt;");
+    }
+
+    #[test]
+    fn test_sanitize_html_preserves_text() {
+        let text = "This is a normal docstring";
+        let sanitized = sanitize_html(text);
+        assert_eq!(sanitized, text);
+    }
+
+    #[tokio::test]
+    async fn test_doc_generation_sanitizes_descriptions() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://postgres:postgres@localhost/crucible_test")
+            .unwrap();
+        let service = DocGeneratorService::new(db);
+
+        let source = r#"
+        /// This function <script>alert('XSS')</script> does something
+        pub fn dangerous_fn() {}
+        "#;
+
+        let doc = service.generate("TestContract", source).await.unwrap();
+        assert!(doc.functions.len() > 0);
+        assert!(!doc.functions[0].description.contains("<script>"));
+        assert!(doc.functions[0].description.contains("&lt;script&gt;"));
     }
 }
