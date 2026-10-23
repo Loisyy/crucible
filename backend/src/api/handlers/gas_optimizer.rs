@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::api::contracts::ApiResponse;
 use crate::error::AppError;
-use crate::services::gas_optimizer::{GasOptimizer, OptimizationResult};
+use crate::services::gas_optimizer::{GasOptimizationReport, GasOptimizer, OptimizationResult};
 use crate::api::handlers::profiling::AppState;
 
 /// Request to analyze bytecode for gas optimization.
@@ -59,12 +59,7 @@ pub async fn get_optimization_report(
     Json(result): Json<OptimizationResult>,
 ) -> Result<impl IntoResponse, AppError> {
     let optimizer = GasOptimizer::new();
-    let report = optimizer.generate_report(&result);
+    let report: GasOptimizationReport = optimizer.generate_optimization_report(&result);
 
-    #[derive(Serialize)]
-    struct ReportResponse {
-        report: String,
-    }
-
-    Ok(Json(ApiResponse::new(ReportResponse { report })))
+    Ok(Json(ApiResponse::new(report)))
 }

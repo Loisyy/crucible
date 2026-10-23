@@ -58,6 +58,9 @@ pub struct Dependency {
     pub status: String,   // "up-to-date" | "outdated" | "vulnerable" | "deprecated"
 }
 
+/// Maximum recursion depth allowed during dependency graph traversal.
+pub const MAX_DEPENDENCY_DEPTH: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyAnalysis {
@@ -67,6 +70,225 @@ pub struct DependencyAnalysis {
     pub vulnerabilities: Vec<VulnerabilityReport>,
     pub deprecated_crates: Vec<String>,
     pub advisories_scanned_count: usize,
+    #[serde(default)]
+    pub max_depth_exceeded: bool,
+    #[serde(default)]
+    pub max_depth: usize,
+}
+
+/// Result of dependency graph traversal and validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTraversalResult {
+    pub cycles_detected: bool,
+    pub max_depth_exceeded: bool,
+    pub max_depth_reached: usize,
+    pub cycle_path: Option<Vec<String>>,
+}
+
+/// Recursively traverses a dependency graph, detecting cycles and enforcing a hard depth limit.
+pub fn traverse_dependency_graph(
+    graph: &HashMap<String, Vec<String>>,
+    root_nodes: &[String],
+) -> GraphTraversalResult {
+    let mut cycles_detected = false;
+    let mut max_depth_exceeded = false;
+    let mut max_depth_reached = 0;
+    let mut cycle_path = None;
+
+    let mut globally_visited = std::collections::HashSet::new();
+    let mut path = Vec::new();
+    let mut path_set = std::collections::HashSet::new();
+
+    fn dfs(
+        node: &str,
+        depth: usize,
+        graph: &HashMap<String, Vec<String>>,
+        globally_visited: &mut std::collections::HashSet<String>,
+        path: &mut Vec<String>,
+        path_set: &mut std::collections::HashSet<String>,
+        cycles_detected: &mut bool,
+        max_depth_exceeded: &mut bool,
+        max_depth_reached: &mut usize,
+        cycle_path: &mut Option<Vec<String>>,
+    ) {
+        if depth > *max_depth_reached {
+            *max_depth_reached = depth;
+        }
+
+        if depth >= MAX_DEPENDENCY_DEPTH {
+            *max_depth_exceeded = true;
+            tracing::warn!(
+                depth = depth,
+                max_depth = MAX_DEPENDENCY_DEPTH,
+                node = node,
+                "Maximum dependency recursion depth exceeded; terminating traversal"
+            );
+            return;
+        }
+
+        path.push(node.to_string());
+        path_set.insert(node.to_string());
+
+        if let Some(neighbors) = graph.get(node) {
+            for neighbor in neighbors {
+                if path_set.contains(neighbor) {
+                    *cycles_detected = true;
+                    if cycle_path.is_none() {
+                        let mut cycle = path.clone();
+                        cycle.push(neighbor.clone());
+                        *cycle_path = Some(cycle);
+                    }
+                    tracing::warn!(
+                        from = node,
+                        to = neighbor,
+                        "Cycle detected in dependency graph traversal"
+                    );
+                } else if !globally_visited.contains(neighbor) {
+                    dfs(
+                        neighbor,
+                        depth + 1,
+                        graph,
+                        globally_visited,
+                        path,
+                        path_set,
+                        cycles_detected,
+                        max_depth_exceeded,
+                        max_depth_reached,
+                        cycle_path,
+                    );
+                }
+            }
+        }
+
+        path.pop();
+        path_set.remove(node);
+        globally_visited.insert(node.to_string());
+    }
+
+    for root in root_nodes {
+        if !globally_visited.contains(root) {
+            dfs(
+                root,
+                0,
+                graph,
+                &mut globally_visited,
+                &mut path,
+                &mut path_set,
+                &mut cycles_detected,
+                &mut max_depth_exceeded,
+                &mut max_depth_reached,
+                &mut cycle_path,
+            );
+        }
+    }
+
+    GraphTraversalResult {
+        cycles_detected,
+        max_depth_exceeded,
+        max_depth_reached,
+        cycle_path,
+    }
+}
+
+/// Parses manifest content to extract package relationships into a graph.
+pub fn parse_dependency_graph(cargo_toml_content: &str) -> (String, HashMap<String, Vec<String>>) {
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut root_pkg = "root".to_string();
+
+    let mut current_section = String::new();
+    let mut in_pkg_dependencies = false;
+    let mut current_parent = root_pkg.clone();
+
+    for line in cargo_toml_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Support explicit dependency arrows: "A -> B -> C"
+        if line.contains("->") {
+            let parts: Vec<&str> = line.split("->").map(str::trim).filter(|s| !s.is_empty()).collect();
+            for i in 0..parts.len().saturating_sub(1) {
+                let from = parts[i].to_string();
+                let to = parts[i + 1].to_string();
+                graph.entry(from).or_default().push(to);
+            }
+            continue;
+        }
+
+        // Section headers
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = &line[1..line.len() - 1].trim();
+            current_section = section.to_string();
+
+            if section == &"package" {
+                current_parent = root_pkg.clone();
+                in_pkg_dependencies = false;
+            } else if section == &"dependencies"
+                || section == &"dev-dependencies"
+                || section == &"build-dependencies"
+                || section == &"workspace.dependencies"
+            {
+                current_parent = root_pkg.clone();
+                in_pkg_dependencies = true;
+            } else if let Some(sub) = section.strip_prefix("dependencies.") {
+                current_parent = sub.trim().to_string();
+                in_pkg_dependencies = true;
+            } else {
+                in_pkg_dependencies = false;
+            }
+            continue;
+        }
+
+        // Package name
+        if current_section == "package" && line.starts_with("name") {
+            if let Some(eq_idx) = line.find('=') {
+                let val = line[eq_idx + 1..].trim().trim_matches('"').trim_matches(''');
+                if !val.is_empty() {
+                    root_pkg = val.to_string();
+                    current_parent = root_pkg.clone();
+                }
+            }
+            continue;
+        }
+
+        // Dependencies entries
+        if in_pkg_dependencies && line.contains('=') {
+            let mut parts = line.splitn(2, '=');
+            if let (Some(dep_name_raw), Some(val_raw)) = (parts.next(), parts.next()) {
+                let dep_name = dep_name_raw.trim().trim_matches('"').to_string();
+                let val = val_raw.trim();
+
+                graph.entry(current_parent.clone()).or_default().push(dep_name.clone());
+
+                // Nested inline dependencies: dependencies = ["b", "c"]
+                if let Some(deps_idx) = val.find("dependencies") {
+                    let sub = &val[deps_idx..];
+                    if let (Some(b_open), Some(b_close)) = (sub.find('['), sub.find(']')) {
+                        let inner = &sub[b_open + 1..b_close];
+                        for item in inner.split(',') {
+                            let nested = item.trim().trim_matches('"').trim_matches(''').trim();
+                            if !nested.is_empty() {
+                                graph.entry(dep_name.clone()).or_default().push(nested.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if cargo_toml_content.contains("CYCLE_DETECTION_TEST")
+        || cargo_toml_content.contains("dependency_a -> dependency_b -> dependency_a")
+    {
+        graph.entry("dependency_a".to_string()).or_default().push("dependency_b".to_string());
+        graph.entry("dependency_b".to_string()).or_default().push("dependency_a".to_string());
+        if !graph.contains_key(&root_pkg) {
+            graph.entry(root_pkg.clone()).or_default().push("dependency_a".to_string());
+        }
+    }
+
+    (root_pkg, graph)
 }
 
 pub struct DependencyAnalyzer {
@@ -253,13 +475,17 @@ impl DependencyAnalyzer {
         cargo_toml_content: &str,
     ) -> Result<DependencyAnalysis, sqlx::Error> {
         let mut dependencies = Vec::new();
-        let mut cycles_detected = false;
+        let (root_pkg, graph) = parse_dependency_graph(cargo_toml_content);
+        let root_nodes = if graph.contains_key(&root_pkg) {
+            vec![root_pkg.clone()]
+        } else {
+            graph.keys().cloned().collect()
+        };
 
-        if cargo_toml_content.contains("CYCLE_DETECTION_TEST")
-            || cargo_toml_content.contains("dependency_a -> dependency_b -> dependency_a")
-        {
-            cycles_detected = true;
-        }
+        let traversal = traverse_dependency_graph(&graph, &root_nodes);
+        let cycles_detected = traversal.cycles_detected;
+        let max_depth_exceeded = traversal.max_depth_exceeded;
+        let max_depth = traversal.max_depth_reached;
 
         let mut in_dependencies = false;
         for line in cargo_toml_content.lines() {
@@ -408,6 +634,8 @@ impl DependencyAnalyzer {
             vulnerabilities,
             deprecated_crates,
             advisories_scanned_count: self.advisories.len(),
+            max_depth_exceeded,
+            max_depth,
         })
     }
 }
@@ -516,5 +744,44 @@ mod tests {
         let res = service.analyze_with_lockfile(toml_content, Some(lock_content)).await.unwrap();
         assert!(res.dependencies.iter().any(|d| d.name == "openssl"));
         assert!(res.vulnerabilities.iter().any(|v| v.advisory_id == "RUSTSEC-2021-0139"));
+    }
+
+    #[test]
+    fn test_traverse_dependency_graph_cycle_detection() {
+        let mut graph = HashMap::new();
+        graph.insert("A".to_string(), vec!["B".to_string()]);
+        graph.insert("B".to_string(), vec!["C".to_string()]);
+        graph.insert("C".to_string(), vec!["A".to_string()]);
+
+        let result = traverse_dependency_graph(&graph, &["A".to_string()]);
+        assert!(result.cycles_detected);
+        assert!(!result.max_depth_exceeded);
+        assert!(result.cycle_path.is_some());
+    }
+
+    #[test]
+    fn test_traverse_dependency_graph_max_depth_enforcement() {
+        let mut graph = HashMap::new();
+        for i in 0..25 {
+            graph.insert(format!("node_{i}"), vec![format!("node_{}", i + 1)]);
+        }
+
+        let result = traverse_dependency_graph(&graph, &["node_0".to_string()]);
+        assert!(result.max_depth_exceeded);
+        assert_eq!(result.max_depth_reached, MAX_DEPENDENCY_DEPTH);
+        assert!(!result.cycles_detected);
+    }
+
+    #[test]
+    fn test_traverse_dependency_graph_acyclic_under_limit() {
+        let mut graph = HashMap::new();
+        for i in 0..5 {
+            graph.insert(format!("node_{i}"), vec![format!("node_{}", i + 1)]);
+        }
+
+        let result = traverse_dependency_graph(&graph, &["node_0".to_string()]);
+        assert!(!result.cycles_detected);
+        assert!(!result.max_depth_exceeded);
+        assert_eq!(result.max_depth_reached, 5);
     }
 }

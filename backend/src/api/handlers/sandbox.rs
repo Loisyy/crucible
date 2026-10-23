@@ -5,6 +5,7 @@ use crate::{
     },
 };
 use axum::{extract::State, routing::post, Router};
+use soroban_sdk::xdr::{Limits, ReadXdr, ScVal};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -36,45 +37,56 @@ pub async fn execute_contract(
     // Validate WASM size (base64 encoded wasm should be reasonable)
     let wasm_size = request.wasm_base64.len();
     const MAX_WASM_BASE64_SIZE: usize = 5 * 1024 * 1024; // 5MB base64
-    
+
     if wasm_size > MAX_WASM_BASE64_SIZE {
-        return Err(ApiError::Validation(
-            format!(
-                "WASM payload exceeds maximum size of {} bytes (got {} bytes)",
-                MAX_WASM_BASE64_SIZE, wasm_size
-            ),
-        ));
+        return Err(ApiError::Validation(format!(
+            "WASM payload exceeds maximum size of {} bytes (got {} bytes)",
+            MAX_WASM_BASE64_SIZE, wasm_size
+        )));
     }
-    
+
     // Validate function name
     if request.function.trim().is_empty() {
         return Err(ApiError::Validation(
             "function name cannot be empty".to_string(),
         ));
     }
-    
+
     // Validate function name length
     if request.function.len() > 256 {
         return Err(ApiError::Validation(
             "function name exceeds maximum length of 256 characters".to_string(),
         ));
     }
-    
-    // Validate args size if present
+
+    // Validate args size and recursion depth if present
     if !request.args_xdr_base64.is_empty() {
         let args_size: usize = request.args_xdr_base64.iter().map(|s| s.len()).sum();
         const MAX_ARGS_SIZE: usize = 1 * 1024 * 1024; // 1MB
-        
+
         if args_size > MAX_ARGS_SIZE {
-            return Err(ApiError::Validation(
-                format!(
-                    "Arguments payload exceeds maximum size of {} bytes (got {} bytes)",
-                    MAX_ARGS_SIZE, args_size
-                ),
-            ));
+            return Err(ApiError::Validation(format!(
+                "Arguments payload exceeds maximum size of {} bytes (got {} bytes)",
+                MAX_ARGS_SIZE, args_size
+            )));
+        }
+
+        // Validate recursion depth for XDR argument structures to prevent stack exhaustion (Issue #1140)
+        const MAX_XDR_DEPTH: u32 = 64;
+        for (i, arg_b64) in request.args_xdr_base64.iter().enumerate() {
+            let limits = Limits {
+                depth: MAX_XDR_DEPTH,
+                len: MAX_ARGS_SIZE,
+            };
+            if let Err(e) = ScVal::from_xdr_base64(arg_b64, limits) {
+                return Err(ApiError::Validation(format!(
+                    "Argument {} exceeds maximum XDR recursion depth of {} or is malformed: {}",
+                    i, MAX_XDR_DEPTH, e
+                )));
+            }
         }
     }
-    
+
     service
         .execute(request)
         .await
@@ -85,7 +97,16 @@ pub async fn execute_contract(
 fn map_sandbox_error(error: SandboxError) -> ApiError {
     match error {
         SandboxError::InvalidRequest(message) => ApiError::Validation(message),
-        SandboxError::Rejected(message) => ApiError::Validation(message),
+        SandboxError::Rejected(message) => {
+            if message.contains("capacity")
+                || message.contains("concurrency")
+                || message.contains("too many")
+            {
+                ApiError::RateLimited
+            } else {
+                ApiError::Validation(message)
+            }
+        }
         SandboxError::TimedOut(message) => ApiError::Internal(message.to_string()),
         SandboxError::Worker(message) => ApiError::Internal(message),
     }
@@ -170,5 +191,138 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_accepts_valid_xdr_arguments() {
+        use soroban_sdk::xdr::WriteXdr;
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+        let arg_val = ScVal::U32(42);
+        let arg_b64 = arg_val.to_xdr_base64(Limits::none()).unwrap();
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": [arg_b64]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_excessively_nested_xdr_arguments() {
+        use soroban_sdk::xdr::{ScVec, WriteXdr};
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+
+        // Build deeply nested ScVal (nested 70 levels deep, exceeding limit of 64)
+        let mut nested = ScVal::U32(1);
+        for _ in 0..70 {
+            nested = ScVal::Vec(Some(ScVec(vec![nested].try_into().unwrap())));
+        }
+        let deeply_nested_b64 = nested.to_xdr_base64(Limits::none()).unwrap();
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": [deeply_nested_b64]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_malformed_xdr_arguments() {
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": ["not_valid_xdr_base64!"]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_returns_too_many_requests_when_capacity_exceeded() {
+        struct RejectingCapacityExecutor;
+        impl ContractExecutor for RejectingCapacityExecutor {
+            fn execute(&self, _execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+                Err(SandboxError::Rejected("sandbox execution thread pool capacity exceeded; too many concurrent invocations".to_string()))
+            }
+        }
+
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(RejectingCapacityExecutor),
+        ));
+        let app = routes(service);
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": []
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

@@ -57,6 +57,10 @@ pub struct TracingConfig {
     pub max_events_per_span: u32,
     /// Maximum number of links per span
     pub max_links_per_span: u32,
+    /// Optional directory to spool telemetry spans when the OTLP collector is unreachable.
+    pub disk_spool_dir: Option<std::path::PathBuf>,
+    /// Maximum disk spool buffer size in bytes (default 50MB).
+    pub max_spool_size_bytes: u64,
 }
 
 impl Default for TracingConfig {
@@ -70,6 +74,8 @@ impl Default for TracingConfig {
             max_attributes_per_span: 128,
             max_events_per_span: 128,
             max_links_per_span: 128,
+            disk_spool_dir: None,
+            max_spool_size_bytes: 50 * 1024 * 1024,
         }
     }
 }
@@ -104,6 +110,13 @@ impl TracingConfig {
     /// Set custom sampling ratio (0.0 to 1.0)
     pub fn with_sampling_ratio(mut self, ratio: f64) -> Self {
         self.sampling_ratio = ratio.max(0.0).min(1.0);
+        self
+    }
+
+    /// Set custom disk spool directory and max spool capacity for telemetry fallback during outages
+    pub fn with_disk_spool(mut self, path: impl Into<std::path::PathBuf>, max_bytes: u64) -> Self {
+        self.disk_spool_dir = Some(path.into());
+        self.max_spool_size_bytes = max_bytes;
         self
     }
 }
@@ -333,9 +346,87 @@ impl TracingService {
     }
 }
 
+/// Persistent disk-backed fallback spool buffer for telemetry spans during collector network outages.
+#[derive(Debug, Clone)]
+pub struct DiskSpoolBuffer {
+    spool_dir: std::path::PathBuf,
+    max_spool_size_bytes: u64,
+}
+
+impl DiskSpoolBuffer {
+    /// Create a new disk spool buffer at the given path with maximum capacity in bytes.
+    pub fn new(spool_dir: impl Into<std::path::PathBuf>, max_spool_size_bytes: u64) -> Self {
+        Self {
+            spool_dir: spool_dir.into(),
+            max_spool_size_bytes,
+        }
+    }
+
+    /// Spool serialized span or batch bytes to disk when network export fails.
+    pub fn spool_telemetry_batch(&self, batch_data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(&self.spool_dir)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let file_name = format!("spool-{}-{}.telemetry", now_ms, uuid::Uuid::new_v4());
+        let path = self.spool_dir.join(file_name);
+        std::fs::write(&path, batch_data)?;
+        Ok(path)
+    }
+
+    /// Read and drain pending spooled telemetry files for replay once collector connectivity recovers.
+    pub fn drain_spooled_batches(&self) -> std::io::Result<Vec<Vec<u8>>> {
+        if !self.spool_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut batches = Vec::new();
+        for entry in std::fs::read_dir(&self.spool_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("telemetry") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    batches.push(bytes);
+                }
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Ok(batches)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_disk_spool_buffer_spool_and_drain() {
+        let temp_dir = std::env::temp_dir().join(format!("test_spool_{}", uuid::Uuid::new_v4()));
+        let buffer = DiskSpoolBuffer::new(&temp_dir, 1024 * 1024);
+
+        let data1 = b"telemetry_batch_1";
+        let data2 = b"telemetry_batch_2";
+
+        let path1 = buffer.spool_telemetry_batch(data1).unwrap();
+        let path2 = buffer.spool_telemetry_batch(data2).unwrap();
+        assert!(path1.exists());
+        assert!(path2.exists());
+
+        let drained = buffer.drain_spooled_batches().unwrap();
+        assert_eq!(drained.len(), 2);
+        assert!(!path1.exists());
+        assert!(!path2.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tracing_config_with_disk_spool() {
+        let config = TracingConfig::default()
+            .with_disk_spool("/tmp/telemetry_spool", 25 * 1024 * 1024);
+        assert_eq!(config.disk_spool_dir, Some(std::path::PathBuf::from("/tmp/telemetry_spool")));
+        assert_eq!(config.max_spool_size_bytes, 25 * 1024 * 1024);
+    }
 
     #[test]
     fn test_trace_context_extraction_and_injection() {
@@ -409,6 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_instrumented_context_propagation() {
+        let _sub = tracing_subscriber::fmt().with_test_writer().set_default();
         let parent_span = TracingService::job_span("test_async_job", "job-1023");
         let _guard = parent_span.enter();
 

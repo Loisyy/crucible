@@ -34,6 +34,36 @@ pub struct SandboxLimits {
     pub max_cpu_instructions: u64,
     pub max_memory_bytes: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_min_ledger_sequence")]
+    pub min_ledger_sequence: u32,
+    #[serde(default = "default_max_ledger_sequence")]
+    pub max_ledger_sequence: u32,
+    #[serde(default = "default_min_ledger_timestamp")]
+    pub min_ledger_timestamp: u64,
+    #[serde(default = "default_max_ledger_timestamp")]
+    pub max_ledger_timestamp: u64,
+    #[serde(default = "default_max_concurrent_executions")]
+    pub max_concurrent_executions: usize,
+}
+
+fn default_min_ledger_sequence() -> u32 {
+    1
+}
+
+fn default_max_ledger_sequence() -> u32 {
+    1_000_000_000
+}
+
+fn default_min_ledger_timestamp() -> u64 {
+    1_000_000_000
+}
+
+fn default_max_ledger_timestamp() -> u64 {
+    4_102_444_800
+}
+
+fn default_max_concurrent_executions() -> usize {
+    32
 }
 
 impl Default for SandboxLimits {
@@ -45,7 +75,29 @@ impl Default for SandboxLimits {
             max_cpu_instructions: 25_000_000,
             max_memory_bytes: 64 * 1024 * 1024,
             timeout_ms: 2_000,
+            min_ledger_sequence: default_min_ledger_sequence(),
+            max_ledger_sequence: default_max_ledger_sequence(),
+            min_ledger_timestamp: default_min_ledger_timestamp(),
+            max_ledger_timestamp: default_max_ledger_timestamp(),
+            max_concurrent_executions: default_max_concurrent_executions(),
         }
+    }
+}
+
+impl SandboxLimits {
+    /// Configure explicit bounds for simulated ledger sequence and timestamp.
+    pub fn with_ledger_bounds(
+        mut self,
+        min_seq: u32,
+        max_seq: u32,
+        min_ts: u64,
+        max_ts: u64,
+    ) -> Self {
+        self.min_ledger_sequence = min_seq;
+        self.max_ledger_sequence = max_seq;
+        self.min_ledger_timestamp = min_ts;
+        self.max_ledger_timestamp = max_ts;
+        self
     }
 }
 
@@ -113,7 +165,7 @@ pub enum SandboxError {
     Worker(String),
 }
 
-/// Prepared execution payload with decoded binary data.
+/// Prepared execution payload with decoded binary data and cooperative cancellation.
 #[derive(Debug, Clone)]
 pub struct PreparedExecution {
     pub wasm: Vec<u8>,
@@ -123,6 +175,29 @@ pub struct PreparedExecution {
     pub ledger_timestamp: Option<u64>,
     pub limits: SandboxLimits,
     pub wasm_sha256: String,
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PreparedExecution {
+    /// Returns true if execution was cancelled (e.g. by timeout or client disconnect).
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Signals cancellation of the running execution.
+    pub fn cancel(&self) {
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Checks if cancellation was requested, returning `SandboxError::TimedOut` if so.
+    pub fn check_cancelled(&self) -> Result<(), SandboxError> {
+        if self.is_cancelled() {
+            Err(SandboxError::TimedOut(self.limits.timeout_ms))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,11 +217,36 @@ pub trait ContractExecutor: Send + Sync + 'static {
     fn execute(&self, execution: PreparedExecution) -> Result<RawExecution, SandboxError>;
 }
 
+/// Guard to signal cooperative cancellation whenever the execution terminates or future is dropped.
+struct CancellationGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { flag, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Contract sandbox facade used by API handlers.
 #[derive(Clone)]
 pub struct ContractSandboxService {
     limits: SandboxLimits,
     executor: Arc<dyn ContractExecutor>,
+    concurrency_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for ContractSandboxService {
@@ -158,16 +258,36 @@ impl Default for ContractSandboxService {
 impl ContractSandboxService {
     /// Creates a service backed by the Soroban executor.
     pub fn new(limits: SandboxLimits) -> Self {
+        let permits = if limits.max_concurrent_executions > 0 {
+            limits.max_concurrent_executions
+        } else {
+            32
+        };
         Self {
             limits,
             executor: Arc::new(SorobanContractExecutor),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
         }
     }
 
     /// Creates a service with an injected executor, used by tests and future
     /// runtime adapters.
     pub fn with_executor(limits: SandboxLimits, executor: Arc<dyn ContractExecutor>) -> Self {
-        Self { limits, executor }
+        let permits = if limits.max_concurrent_executions > 0 {
+            limits.max_concurrent_executions
+        } else {
+            32
+        };
+        Self {
+            limits,
+            executor,
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+        }
+    }
+
+    /// Returns the number of currently available execution permits in the thread pool.
+    pub fn available_concurrency(&self) -> usize {
+        self.concurrency_semaphore.available_permits()
     }
 
     /// Validates, executes, and formats a sandbox invocation.
@@ -176,11 +296,34 @@ impl ContractSandboxService {
         request: ContractExecutionRequest,
     ) -> Result<ContractExecutionResponse, SandboxError> {
         let started = Instant::now();
-        let prepared = self.prepare(request)?;
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prepared = self.prepare_with_cancellation(request, Arc::clone(&cancel_flag))?;
         let timeout_ms = prepared.limits.timeout_ms;
         let function = prepared.function.clone();
         let wasm_sha256 = prepared.wasm_sha256.clone();
         let executor = Arc::clone(&self.executor);
+
+        // Acquire bounded execution permit to prevent Tokio blocking threadpool starvation
+        let permit = match self.concurrency_semaphore.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                let wait_duration = Duration::from_millis(100.min(timeout_ms));
+                match tokio::time::timeout(wait_duration, self.concurrency_semaphore.acquire())
+                    .await
+                {
+                    Ok(Ok(p)) => p,
+                    _ => {
+                        return Err(SandboxError::Rejected(
+                            "sandbox execution thread pool capacity exceeded; too many concurrent invocations"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+
+        let cancel_guard = CancellationGuard::new(Arc::clone(&cancel_flag));
+        let worker_cancel_flag = Arc::clone(&cancel_flag);
 
         let worker = tokio::task::spawn_blocking(move || {
             catch_unwind(AssertUnwindSafe(|| executor.execute(prepared)))
@@ -188,39 +331,47 @@ impl ContractSandboxService {
         });
 
         let raw = match tokio::time::timeout(Duration::from_millis(timeout_ms), worker).await {
-            Ok(result) => match result.map_err(join_error_to_sandbox)? {
-                Ok(raw) => raw,
-                Err(SandboxError::Rejected(message)) => {
-                    return Ok(ContractExecutionResponse {
-                        execution_id: Uuid::new_v4(),
-                        status: ExecutionStatus::Rejected,
-                        contract_id: None,
-                        function,
-                        wasm_sha256,
-                        result_xdr_base64: None,
-                        diagnostics: vec![message],
-                        cpu_instructions: 0,
-                        memory_bytes: 0,
-                        elapsed_ms: started.elapsed().as_millis(),
-                    });
+            Ok(result) => {
+                cancel_guard.disarm();
+                drop(permit);
+                match result.map_err(join_error_to_sandbox)? {
+                    Ok(raw) => raw,
+                    Err(SandboxError::Rejected(message)) => {
+                        return Ok(ContractExecutionResponse {
+                            execution_id: Uuid::new_v4(),
+                            status: ExecutionStatus::Rejected,
+                            contract_id: None,
+                            function,
+                            wasm_sha256,
+                            result_xdr_base64: None,
+                            diagnostics: vec![message],
+                            cpu_instructions: 0,
+                            memory_bytes: 0,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                    Err(SandboxError::TimedOut(timeout)) => {
+                        return Ok(ContractExecutionResponse {
+                            execution_id: Uuid::new_v4(),
+                            status: ExecutionStatus::TimedOut,
+                            contract_id: None,
+                            function,
+                            wasm_sha256,
+                            result_xdr_base64: None,
+                            diagnostics: vec![format!("execution exceeded {timeout} ms timeout")],
+                            cpu_instructions: 0,
+                            memory_bytes: 0,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(SandboxError::TimedOut(timeout)) => {
-                    return Ok(ContractExecutionResponse {
-                        execution_id: Uuid::new_v4(),
-                        status: ExecutionStatus::TimedOut,
-                        contract_id: None,
-                        function,
-                        wasm_sha256,
-                        result_xdr_base64: None,
-                        diagnostics: vec![format!("execution exceeded {timeout} ms timeout")],
-                        cpu_instructions: 0,
-                        memory_bytes: 0,
-                        elapsed_ms: started.elapsed().as_millis(),
-                    });
-                }
-                Err(error) => return Err(error),
-            },
+            }
             Err(_) => {
+                // Signal cooperative cancellation to force-terminate blocking thread
+                worker_cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel_guard.disarm();
+                drop(permit);
                 return Ok(ContractExecutionResponse {
                     execution_id: Uuid::new_v4(),
                     status: ExecutionStatus::TimedOut,
@@ -250,9 +401,17 @@ impl ContractSandboxService {
         })
     }
 
-    fn prepare(
+    pub fn prepare(
         &self,
         request: ContractExecutionRequest,
+    ) -> Result<PreparedExecution, SandboxError> {
+        self.prepare_with_cancellation(request, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    pub fn prepare_with_cancellation(
+        &self,
+        request: ContractExecutionRequest,
+        cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<PreparedExecution, SandboxError> {
         validate_function_name(&request.function)?;
         if request.args_xdr_base64.len() > self.limits.max_args {
@@ -283,6 +442,24 @@ impl ContractSandboxService {
             args_xdr.push(arg);
         }
 
+        if let Some(seq) = request.ledger_sequence {
+            if seq < self.limits.min_ledger_sequence || seq > self.limits.max_ledger_sequence {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "ledger_sequence {} is out of valid bounds [{}..{}]",
+                    seq, self.limits.min_ledger_sequence, self.limits.max_ledger_sequence
+                )));
+            }
+        }
+
+        if let Some(ts) = request.ledger_timestamp {
+            if ts < self.limits.min_ledger_timestamp || ts > self.limits.max_ledger_timestamp {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "ledger_timestamp {} is out of valid bounds [{}..{}]",
+                    ts, self.limits.min_ledger_timestamp, self.limits.max_ledger_timestamp
+                )));
+            }
+        }
+
         let limits = self.effective_limits(request.budget)?;
         let wasm_sha256 = to_hex(&Sha256::digest(&wasm));
 
@@ -294,6 +471,7 @@ impl ContractSandboxService {
             ledger_timestamp: request.ledger_timestamp,
             limits,
             wasm_sha256,
+            cancel_flag,
         })
     }
 
@@ -335,6 +513,8 @@ pub struct SorobanContractExecutor;
 
 impl ContractExecutor for SorobanContractExecutor {
     fn execute(&self, execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+        execution.check_cancelled()?;
+
         let env = Env::default();
         env.mock_all_auths();
         configure_ledger(&env, execution.ledger_sequence, execution.ledger_timestamp);
@@ -345,13 +525,20 @@ impl ContractExecutor for SorobanContractExecutor {
             execution.limits.max_memory_bytes,
         );
 
+        execution.check_cancelled()?;
+
         let args = decode_args(&env, &execution.args_xdr)?;
         let wasm = Bytes::from_slice(&env, &execution.wasm);
+
+        execution.check_cancelled()?;
+
         // Using register_contract_wasm is currently the only straightforward way
         // to dynamically register an arbitrary WASM blob in the sandbox execution environment.
         #[allow(deprecated)]
         let contract_id = env.register_contract_wasm(None, wasm);
         let symbol = Symbol::new(&env, &execution.function);
+
+        execution.check_cancelled()?;
 
         let invocation = catch_unwind(AssertUnwindSafe(|| {
             env.invoke_contract::<Val>(&contract_id, &symbol, args)
@@ -374,7 +561,7 @@ impl ContractExecutor for SorobanContractExecutor {
                     cpu_instructions,
                     memory_bytes,
                 })
-            },
+            }
             Err(panic) => Ok(RawExecution {
                 status: ExecutionStatus::Reverted,
                 contract_id,
@@ -617,9 +804,11 @@ mod tests {
 
     impl ContractExecutor for ForeverExecutor {
         fn execute(&self, _execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
-            self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::sleep(StdDuration::from_millis(200));
-            self.finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(RawExecution {
                 status: ExecutionStatus::Succeeded,
                 contract_id: None,
@@ -722,7 +911,19 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_validates_ledger_state_input() {
-        let service = ContractSandboxService::default();
+        let service = ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(StaticExecutor {
+                raw: RawExecution {
+                    status: ExecutionStatus::Succeeded,
+                    contract_id: None,
+                    result_xdr: None,
+                    diagnostics: Vec::new(),
+                    cpu_instructions: 1,
+                    memory_bytes: 1,
+                },
+            }),
+        );
         let mut req = request();
         req.ledger_sequence = Some(42);
         req.ledger_timestamp = Some(1_700_000_000);
@@ -756,9 +957,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..5 {
             let svc = service.clone();
-            let handle = tokio::spawn(async move {
-                svc.execute(request()).await
-            });
+            let handle = tokio::spawn(async move { svc.execute(request()).await });
             handles.push(handle);
         }
 
@@ -769,7 +968,6 @@ mod tests {
             assert!(result.unwrap().is_ok());
         }
     }
-
 
     fn request() -> ContractExecutionRequest {
         ContractExecutionRequest {
@@ -864,5 +1062,206 @@ mod tests {
         let error = service.execute(req).await.unwrap_err();
 
         assert!(matches!(error, SandboxError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_out_of_bounds_ledger_sequence() {
+        let service = ContractSandboxService::default();
+
+        // Zero is invalid (genesis is 1)
+        let mut req_zero = request();
+        req_zero.ledger_sequence = Some(0);
+        let err_zero = service.execute(req_zero).await.unwrap_err();
+        assert!(matches!(err_zero, SandboxError::InvalidRequest(_)));
+        assert!(err_zero
+            .to_string()
+            .contains("ledger_sequence 0 is out of valid bounds"));
+
+        // Exceeding max is invalid
+        let mut req_high = request();
+        req_high.ledger_sequence = Some(2_000_000_000);
+        let err_high = service.execute(req_high).await.unwrap_err();
+        assert!(matches!(err_high, SandboxError::InvalidRequest(_)));
+        assert!(err_high
+            .to_string()
+            .contains("ledger_sequence 2000000000 is out of valid bounds"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_out_of_bounds_ledger_timestamp() {
+        let service = ContractSandboxService::default();
+
+        // Far past before genesis
+        let mut req_low = request();
+        req_low.ledger_timestamp = Some(500);
+        let err_low = service.execute(req_low).await.unwrap_err();
+        assert!(matches!(err_low, SandboxError::InvalidRequest(_)));
+        assert!(err_low
+            .to_string()
+            .contains("ledger_timestamp 500 is out of valid bounds"));
+
+        // Far future
+        let mut req_future = request();
+        req_future.ledger_timestamp = Some(5_000_000_000);
+        let err_future = service.execute(req_future).await.unwrap_err();
+        assert!(matches!(err_future, SandboxError::InvalidRequest(_)));
+        assert!(err_future
+            .to_string()
+            .contains("ledger_timestamp 5000000000 is out of valid bounds"));
+    }
+
+    #[tokio::test]
+    async fn execute_respects_custom_ledger_bounds() {
+        let limits =
+            SandboxLimits::default().with_ledger_bounds(100, 200, 1_500_000_000, 1_600_000_000);
+        let service = ContractSandboxService::new(limits);
+
+        // Sequence 42 should now fail under custom bounds [100..200]
+        let mut req = request();
+        req.ledger_sequence = Some(42);
+        req.ledger_timestamp = Some(1_550_000_000);
+        let err = service.execute(req).await.unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidRequest(_)));
+        assert!(err
+            .to_string()
+            .contains("ledger_sequence 42 is out of valid bounds [100..200]"));
+    }
+
+    #[tokio::test]
+    async fn timeout_signals_cancellation_and_terminates_cooperative_executor() {
+        struct CooperativeLoopExecutor {
+            started: Arc<std::sync::atomic::AtomicBool>,
+            stopped_by_cancellation: Arc<std::sync::atomic::AtomicBool>,
+            completed_full_loop: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl ContractExecutor for CooperativeLoopExecutor {
+            fn execute(&self, execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..100 {
+                    if execution.is_cancelled() {
+                        self.stopped_by_cancellation
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        return Err(SandboxError::TimedOut(execution.limits.timeout_ms));
+                    }
+                    thread::sleep(StdDuration::from_millis(5));
+                }
+                self.completed_full_loop
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(RawExecution {
+                    status: ExecutionStatus::Succeeded,
+                    contract_id: None,
+                    result_xdr: None,
+                    diagnostics: Vec::new(),
+                    cpu_instructions: 100,
+                    memory_bytes: 100,
+                })
+            }
+        }
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_by_cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_full_loop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let limits = SandboxLimits {
+            timeout_ms: 20,
+            ..SandboxLimits::default()
+        };
+
+        let executor = Arc::new(CooperativeLoopExecutor {
+            started: Arc::clone(&started),
+            stopped_by_cancellation: Arc::clone(&stopped_by_cancellation),
+            completed_full_loop: Arc::clone(&completed_full_loop),
+        });
+
+        let service = ContractSandboxService::with_executor(limits, executor);
+        let res = service.execute(request()).await.unwrap();
+
+        assert_eq!(res.status, ExecutionStatus::TimedOut);
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Allow cooperative thread to observe cancellation
+        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
+
+        assert!(
+            stopped_by_cancellation.load(std::sync::atomic::Ordering::SeqCst),
+            "Expected worker thread to terminate early via cooperative cancellation flag"
+        );
+        assert!(
+            !completed_full_loop.load(std::sync::atomic::Ordering::SeqCst),
+            "Timed-out thread must not run full infinite loop to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_concurrency_semaphore_bounds_thread_pool() {
+        struct SlowExecutor;
+        impl ContractExecutor for SlowExecutor {
+            fn execute(&self, _execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+                thread::sleep(StdDuration::from_millis(150));
+                Ok(RawExecution {
+                    status: ExecutionStatus::Succeeded,
+                    contract_id: None,
+                    result_xdr: None,
+                    diagnostics: Vec::new(),
+                    cpu_instructions: 1,
+                    memory_bytes: 1,
+                })
+            }
+        }
+
+        let limits = SandboxLimits {
+            max_concurrent_executions: 2,
+            timeout_ms: 500,
+            ..SandboxLimits::default()
+        };
+
+        let service = Arc::new(ContractSandboxService::with_executor(
+            limits,
+            Arc::new(SlowExecutor),
+        ));
+
+        // Saturate pool with 2 tasks
+        let s1 = Arc::clone(&service);
+        let h1 = tokio::spawn(async move { s1.execute(request()).await });
+
+        let s2 = Arc::clone(&service);
+        let h2 = tokio::spawn(async move { s2.execute(request()).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert_eq!(service.available_concurrency(), 0);
+
+        // Third execution with short timeout must reject due to capacity limit
+        let mut req3 = request();
+        req3.budget = SandboxBudget {
+            timeout_ms: Some(25),
+            ..Default::default()
+        };
+        let s3 = Arc::clone(&service);
+        let res3 = s3.execute(req3).await;
+
+        assert!(res3.is_err());
+        match res3.unwrap_err() {
+            SandboxError::Rejected(msg) => {
+                assert!(msg.contains("capacity exceeded"));
+            }
+            other => panic!("Expected capacity exceeded error, got {:?}", other),
+        }
+
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        assert_eq!(service.available_concurrency(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_guard_triggers_on_future_drop() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = CancellationGuard::new(Arc::clone(&flag));
+            assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

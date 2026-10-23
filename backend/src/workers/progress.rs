@@ -1,8 +1,17 @@
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
+
+/// Phase transition event broadcast when a job transitions between stages.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PhaseTransitionEvent {
+    pub job_id: String,
+    pub previous_phase: Option<String>,
+    pub new_phase: String,
+    pub timestamp_ms: u64,
+}
 
 /// Job progress tracker that monitors and reports job execution status
 #[derive(Debug, Clone)]
@@ -43,7 +52,7 @@ impl JobProgressTracker {
         // Get Redis connection
         let mut redis_conn = self.redis_client.get_multiplexed_async_connection().await?;
 
-        // Get list of running jobs from Redis (assuming they're stored with "job:" prefix)
+        // Get list of running jobs from Redis (assuming they're stored with "job:*:progress" prefix)
         let job_keys: Vec<String> = redis_conn.keys("job:*:progress").await?;
 
         for key in job_keys {
@@ -58,9 +67,11 @@ impl JobProgressTracker {
 
                         // Calculate progress percentage if applicable
                         if let Some(total_steps) = progress.total_steps {
-                            progress.progress_percentage =
-                                (progress.completed_steps as f64 / total_steps as f64 * 100.0)
-                                    as u8;
+                            if total_steps > 0 {
+                                progress.progress_percentage =
+                                    (progress.completed_steps as f64 / total_steps as f64 * 100.0)
+                                        as u8;
+                            }
                         }
 
                         // Evict completed jobs (100% progress) from active tracking to prevent memory accumulation
@@ -119,13 +130,30 @@ impl JobProgressTracker {
         let mut redis_conn = self.redis_client.get_multiplexed_async_connection().await?;
         let key = format!("job:{}:progress", job_id);
 
+        let current = self.get_job_progress(job_id).await?;
+        let started_at = current.as_ref().map(|p| p.started_at).unwrap_or_else(Instant::now);
+        let current_phase = current.as_ref().and_then(|p| p.current_phase.clone());
+        let previous_phase = current.as_ref().and_then(|p| p.previous_phase.clone());
+
+        let progress_percentage = if let Some(total) = total_steps {
+            if total > 0 {
+                (completed_steps as f64 / total as f64 * 100.0) as u8
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         let progress = JobProgress {
             job_id: job_id.to_string(),
             completed_steps,
             total_steps,
-            progress_percentage: 0,
+            progress_percentage,
+            current_phase,
+            previous_phase,
             last_updated: Instant::now(),
-            started_at: Instant::now(),
+            started_at,
         };
 
         redis_conn
@@ -138,6 +166,75 @@ impl JobProgressTracker {
 
         Ok(())
     }
+
+    /// Update job execution phase, emitting an explicit PhaseTransitionEvent even for sub-second stages
+    pub async fn update_job_phase(
+        &self,
+        job_id: &str,
+        new_phase: &str,
+        completed_steps: u64,
+        total_steps: Option<u64>,
+    ) -> Result<Option<PhaseTransitionEvent>, Box<dyn std::error::Error>> {
+        let mut redis_conn = self.redis_client.get_multiplexed_async_connection().await?;
+        let key = format!("job:{}:progress", job_id);
+
+        let current = self.get_job_progress(job_id).await?;
+        let started_at = current.as_ref().map(|p| p.started_at).unwrap_or_else(Instant::now);
+        let previous_phase = current.as_ref().and_then(|p| p.current_phase.clone());
+
+        let transition_event = if previous_phase.as_deref() != Some(new_phase) {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let event = PhaseTransitionEvent {
+                job_id: job_id.to_string(),
+                previous_phase: previous_phase.clone(),
+                new_phase: new_phase.to_string(),
+                timestamp_ms: now_ms,
+            };
+
+            // Publish phase transition event to Redis channel so WebSocket consumers receive immediate notice
+            let event_json = serde_json::to_string(&event)?;
+            let _: () = redis_conn.publish("job:events", &event_json).await?;
+            info!(job_id = %job_id, phase = %new_phase, "Emitted phase transition event");
+            Some(event)
+        } else {
+            None
+        };
+
+        let progress_percentage = if let Some(total) = total_steps {
+            if total > 0 {
+                (completed_steps as f64 / total as f64 * 100.0) as u8
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let progress = JobProgress {
+            job_id: job_id.to_string(),
+            completed_steps,
+            total_steps,
+            progress_percentage,
+            current_phase: Some(new_phase.to_string()),
+            previous_phase,
+            last_updated: Instant::now(),
+            started_at,
+        };
+
+        redis_conn
+            .set_ex::<_, _, ()>(
+                &key,
+                serde_json::to_string(&progress)?,
+                3600_u64,
+            )
+            .await?;
+
+        Ok(transition_event)
+    }
 }
 
 /// Job progress structure
@@ -147,6 +244,10 @@ pub struct JobProgress {
     pub completed_steps: u64,
     pub total_steps: Option<u64>,
     pub progress_percentage: u8,
+    #[serde(default)]
+    pub current_phase: Option<String>,
+    #[serde(default)]
+    pub previous_phase: Option<String>,
     #[serde(with = "instant_serde")]
     pub last_updated: std::time::Instant,
     #[serde(with = "instant_serde")]
@@ -181,5 +282,47 @@ mod instant_serde {
             StringOrU64::Num(n) => n,
         };
         Ok(Instant::now() - Duration::from_secs(secs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phase_transition_event_serialization() {
+        let event = PhaseTransitionEvent {
+            job_id: "build-123".to_string(),
+            previous_phase: Some("compiling".to_string()),
+            new_phase: "linking".to_string(),
+            timestamp_ms: 1700000000000,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PhaseTransitionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, parsed);
+        assert_eq!(parsed.job_id, "build-123");
+        assert_eq!(parsed.previous_phase.as_deref(), Some("compiling"));
+        assert_eq!(parsed.new_phase, "linking");
+    }
+
+    #[test]
+    fn test_job_progress_with_phase_information() {
+        let progress = JobProgress {
+            job_id: "test-job".to_string(),
+            completed_steps: 1,
+            total_steps: Some(10),
+            progress_percentage: 10,
+            current_phase: Some("init".to_string()),
+            previous_phase: None,
+            last_updated: Instant::now(),
+            started_at: Instant::now(),
+        };
+
+        let json = serde_json::to_string(&progress).unwrap();
+        let deserialized: JobProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.job_id, "test-job");
+        assert_eq!(deserialized.current_phase.as_deref(), Some("init"));
+        assert_eq!(deserialized.previous_phase, None);
     }
 }

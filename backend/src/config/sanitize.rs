@@ -127,10 +127,77 @@ pub fn sanitize(config: &crate::config::AppConfig) -> SanitizedConfig {
     }
 }
 
+/// Sanitize user-provided string input by stripping HTML tags, ASCII control characters,
+/// Unicode bidirectional overrides (such as U+202E), and zero-width characters that can be used
+/// for visual spoofing or prompt injection attacks.
+pub fn sanitize_input(input: &str) -> String {
+    // 1. Remove HTML tags
+    let mut no_html = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for c in input.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            no_html.push(c);
+        }
+    }
+
+    // 2. Filter out ASCII control characters, zero-width characters, and Unicode bidi control characters
+    no_html
+        .chars()
+        .filter(|&c| {
+            if c.is_ascii_control() {
+                return false;
+            }
+            !is_bidi_or_zero_width(c)
+        })
+        .collect()
+}
+
+/// Returns true if a codepoint is a zero-width space/joiner or Unicode bidirectional override/control.
+pub fn is_bidi_or_zero_width(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200D}' // Zero-Width Space (U+200B), Zero-Width Non-Joiner (U+200C), Zero-Width Joiner (U+200D)
+        | '\u{FEFF}'             // Zero-Width No-Break Space / BOM (U+FEFF)
+        | '\u{200E}'             // Left-to-Right Mark (U+200E)
+        | '\u{200F}'             // Right-to-Left Mark (U+200F)
+        | '\u{061C}'             // Arabic Letter Mark (U+061C)
+        | '\u{202A}'..='\u{202E}' // Bidi embeddings and overrides: LRE (U+202A), RLE (U+202B), PDF (U+202C), LRO (U+202D), RLO (U+202E)
+        | '\u{2066}'..='\u{2069}' // Bidi isolates: LRI (U+2066), RLI (U+2067), FSI (U+2068), PDI (U+2069)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Environment;
+
+    #[test]
+    fn test_sanitize_input_strips_html_and_ascii_control() {
+        let input = "<b>Hello</b>\x00\x07World\r\n";
+        let output = sanitize_input(input);
+        assert_eq!(output, "HelloWorld");
+    }
+
+    #[test]
+    fn test_sanitize_input_strips_bidi_override_and_zero_width() {
+        // U+202E (Right-to-Left Override) and U+200D (Zero Width Joiner) and U+200B (Zero Width Space)
+        let malicious = "admin\u{202E}cod\u{200D}e\u{200B}";
+        let sanitized = sanitize_input(malicious);
+        assert_eq!(sanitized, "admincode");
+        assert!(!sanitized.contains('\u{202E}'));
+        assert!(!sanitized.contains('\u{200D}'));
+        assert!(!sanitized.contains('\u{200B}'));
+    }
+
+    #[test]
+    fn test_sanitize_input_preserves_clean_unicode() {
+        let clean = "こんにちは世界 - Hello World 123!";
+        assert_eq!(sanitize_input(clean), clean);
+    }
 
     #[test]
     fn test_sanitize_redacts_database_url() {

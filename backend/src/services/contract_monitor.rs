@@ -2,8 +2,11 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::{interval, Interval, MissedTickBehavior};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +41,14 @@ impl ContractMonitor {
             rules: Arc::new(RwLock::new(vec![])),
             alerts: Arc::new(RwLock::new(vec![])),
         }
+    }
+
+    /// Creates a Tokio interval configured with MissedTickBehavior::Skip
+    /// to avoid cumulative scheduling drift under event loop pressure (#1219).
+    pub fn create_interval(period: Duration) -> Interval {
+        let mut ticker = interval(period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker
     }
 
     pub async fn add_rule(
@@ -142,10 +153,167 @@ impl ContractMonitor {
         }
         false
     }
+
+    /// Polls contract metrics at a steady cadence using `tokio::time::interval`
+    /// configured with `MissedTickBehavior::Skip` to eliminate scheduling drift (#1219).
+    pub async fn poll_contract_metrics<F, Fut>(
+        &self,
+        contract_address: &str,
+        period: Duration,
+        iterations: usize,
+        mut fetch_metric: F,
+    ) -> Vec<MonitorAlert>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = f64>,
+    {
+        let mut ticker = Self::create_interval(period);
+        let mut all_alerts = Vec::new();
+
+        for _ in 0..iterations {
+            ticker.tick().await;
+            let val = fetch_metric().await;
+            let alerts = self.check_and_alert(contract_address, val).await;
+            all_alerts.extend(alerts);
+        }
+
+        all_alerts
+    }
+
+    /// Runs a steady-cadence polling loop with a cancellation flag, avoiding drift (#1219).
+    pub async fn poll_until_stopped<F, Fut>(
+        &self,
+        period: Duration,
+        running: Arc<AtomicBool>,
+        mut check_fn: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut ticker = Self::create_interval(period);
+        while running.load(Ordering::Relaxed) {
+            ticker.tick().await;
+            check_fn().await;
+        }
+    }
 }
 
 impl Default for ContractMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_rules_crud() {
+        let monitor = ContractMonitor::new();
+        let rule = monitor.add_rule("0x123", "high_gas", 5000.0).await;
+        assert_eq!(rule.contract_address, "0x123");
+        assert_eq!(rule.rule_type, "high_gas");
+        assert_eq!(rule.threshold, 5000.0);
+        assert!(rule.enabled);
+
+        let rules = monitor.list_rules(Some("0x123")).await;
+        assert_eq!(rules.len(), 1);
+
+        let empty_rules = monitor.list_rules(Some("0xOTHER")).await;
+        assert_eq!(empty_rules.len(), 0);
+
+        let removed = monitor.remove_rule(&rule.id).await;
+        assert!(removed);
+        assert_eq!(monitor.list_rules(None).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_alert_severities() {
+        let monitor = ContractMonitor::new();
+        monitor.add_rule("0xABC", "latency", 100.0).await;
+
+        // Below threshold: no alert
+        let alerts = monitor.check_and_alert("0xABC", 50.0).await;
+        assert!(alerts.is_empty());
+
+        // Above 1.0x: info
+        let alerts = monitor.check_and_alert("0xABC", 110.0).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "info");
+
+        // Above 1.5x: warning
+        let alerts = monitor.check_and_alert("0xABC", 160.0).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warning");
+
+        // Above 2.0x: critical
+        let alerts = monitor.check_and_alert("0xABC", 250.0).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "critical");
+
+        let all_alerts = monitor.list_alerts(Some("0xABC"), Some(false)).await;
+        assert_eq!(all_alerts.len(), 3);
+
+        let resolved = monitor.resolve_alert(&alerts[0].id).await;
+        assert!(resolved);
+
+        let unresolved = monitor.list_alerts(Some("0xABC"), Some(false)).await;
+        assert_eq!(unresolved.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_poll_contract_metrics_cadence() {
+        let monitor = ContractMonitor::new();
+        monitor.add_rule("0xCADENCE", "error_rate", 0.05).await;
+
+        let mut count = 0;
+        let alerts = monitor
+            .poll_contract_metrics(
+                "0xCADENCE",
+                Duration::from_millis(5),
+                3,
+                || {
+                    count += 1;
+                    async move {
+                        if count == 2 {
+                            0.10 // Triggers warning alert
+                        } else {
+                            0.01
+                        }
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warning");
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_stopped_cancellation() {
+        let monitor = ContractMonitor::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let running_clone = running.clone();
+        let count_clone = count.clone();
+
+        let handle = tokio::spawn(async move {
+            monitor
+                .poll_until_stopped(Duration::from_millis(5), running_clone, || {
+                    let c = count_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        running.store(false, Ordering::Relaxed);
+        let _ = handle.await;
+
+        assert!(count.load(Ordering::Relaxed) >= 2);
     }
 }

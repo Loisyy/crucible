@@ -918,4 +918,26 @@ mod tests {
     fn escape_pgpass_field_escapes_specials() {
         assert_eq!(escape_pgpass_field("a:b\\c"), "a\\:b\\\\c");
     }
+
+    #[test]
+    fn test_issue_1257_pg_dump_credentials_isolated_via_pgpass() {
+        // Issue #1257: Database Backup CLI Passes Password in Command Line Arguments
+        let database_url = "postgres://backup_user:super_secret_pw@db.internal:5432/crucible_prod";
+        let parts = parse_database_url(database_url).expect("valid database url");
+        assert_eq!(parts.user, "backup_user");
+        assert_eq!(parts.password, "super_secret_pw");
+
+        // Verify that credentials are written to isolated temp .pgpass file and zeroized on drop
+        let pgpass = TempPgpass::create(&parts).expect("create pgpass");
+        let path = pgpass.path().to_path_buf();
+        assert!(path.exists());
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("super_secret_pw"));
+        assert!(!contents.contains("DATABASE_URL"));
+
+        drop(pgpass);
+        assert!(!path.exists(), "temporary pgpass must be wiped and removed on drop");
+    }
 }
+

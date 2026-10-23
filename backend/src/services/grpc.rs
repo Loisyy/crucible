@@ -24,7 +24,7 @@ impl Default for GrpcServerConfig {
             http2_keepalive_interval: Duration::from_secs(30),
             http2_keepalive_timeout: Duration::from_secs(10),
             max_connection_age: Duration::from_secs(300), // 5 minutes
-            max_decoding_message_size: 10 * 1024 * 1024, // 10 MB
+            max_decoding_message_size: 10 * 1024 * 1024,  // 10 MB
         }
     }
 }
@@ -94,19 +94,16 @@ impl InternalGrpcService {
         self.grpc_config.clone().unwrap_or_default()
     }
 
-    /// Build a Tonic Server with proper keepalive and message size configuration
-    pub fn build_server_with_config(&self) -> tonic::transport::server::Router {
+    /// Build a Tonic Server with proper keepalive configuration
+    pub fn build_server_with_config(&self) -> Server {
         let config = self.config();
-        
+
         Server::builder()
             // Configure HTTP/2 keepalive to detect dead connections
             .http2_keepalive_interval(Some(config.http2_keepalive_interval))
             .http2_keepalive_timeout(Some(config.http2_keepalive_timeout))
             // Force close connections after max_connection_age
-            .max_connection_age(Some(config.max_connection_age))
-            // Limit inbound message size to prevent OOM attacks
-            .max_decoding_message_size(config.max_decoding_message_size)
-            .max_encoding_message_size(config.max_decoding_message_size)
+            .max_connection_age(config.max_connection_age)
     }
 
     /// Process high-speed ping diagnostic request

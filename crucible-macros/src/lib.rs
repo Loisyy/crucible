@@ -145,7 +145,7 @@ pub fn fixture(args: TokenStream, input: TokenStream) -> TokenStream {
     // A fixture that requires itself is a cycle of length one, which is
     // detectable from this item alone.
     for dependency in &requires {
-        if dependency.is_ident(ident) {
+        if dependency.is_ident(ident) || normalize_path_name(dependency) == ident.to_string() {
             return Error::new_spanned(
                 dependency,
                 format!(
@@ -163,7 +163,7 @@ pub fn fixture(args: TokenStream, input: TokenStream) -> TokenStream {
             duplicate,
             format!(
                 "duplicate fixture dependency: `{}` is required more than once",
-                path_name(duplicate)
+                normalize_path_name(duplicate)
             ),
         )
         .to_compile_error()
@@ -213,11 +213,13 @@ fn parse_fixture_args(args: proc_macro2::TokenStream) -> Result<Vec<syn::Path>, 
         return Ok(Vec::new());
     }
 
-    let meta: syn::Meta = syn::parse2(args.clone()).map_err(|_| {
-        Error::new_spanned(
+    let meta: syn::Meta = syn::parse2(args.clone()).map_err(|err| {
+        let mut note = Error::new_spanned(
             &args,
             "#[fixture] takes no arguments other than `requires = [..]`",
-        )
+        );
+        note.combine(err);
+        note
     })?;
 
     let syn::Meta::NameValue(name_value) = meta else {
@@ -257,15 +259,31 @@ fn parse_fixture_args(args: proc_macro2::TokenStream) -> Result<Vec<syn::Path>, 
 /// Returns the first path that appears more than once in `paths`.
 fn first_duplicate(paths: &[syn::Path]) -> Option<&syn::Path> {
     for (index, path) in paths.iter().enumerate() {
-        let name = path_name(path);
-        if paths[..index].iter().any(|prior| path_name(prior) == name) {
+        let name = normalize_path_name(path);
+        if paths[..index]
+            .iter()
+            .any(|prior| normalize_path_name(prior) == name)
+        {
             return Some(path);
         }
     }
     None
 }
 
+/// Returns the canonical identity string for a dependency path.
+///
+/// Normalizes paths by their trailing identifier so that unqualified paths like
+/// `TokenFixture` and qualified paths like `crate::fixtures::TokenFixture` are
+/// recognized as identical types during duplicate and cycle detection.
+fn normalize_path_name(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .unwrap_or_default()
+}
+
 /// Renders a path as the `::`-joined source text of its segments.
+#[allow(dead_code)]
 fn path_name(path: &syn::Path) -> String {
     path.segments
         .iter()
@@ -294,15 +312,29 @@ fn dependency_graph_impl(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let deps_tuple = quote! { (#(#requires,)*) };
-    let deps_setup = quote! { (#(<#requires as crucible_fixture_graph::FixtureDeps>::setup_checked(),)*) };
+    let deps_setup =
+        quote! { (#(<#requires as crucible_fixture_graph::FixtureDeps>::setup_checked(),)*) };
     let dep_count = requires.len();
-    let dep_names = requires.iter().map(path_name);
+    let dep_names = requires.iter().map(normalize_path_name);
 
     // Each dependency must itself be acyclic before this fixture can be, so a
     // cycle becomes an obligation with no base case and the compiler rejects it
     // rather than accepting a graph that could never be constructed.
     let acyclic_bounds = requires.iter().map(|dependency| {
         quote! { #dependency: crucible_fixture_graph::AcyclicFixture }
+    });
+
+    // Fully qualified type equality assertions in the generated AcyclicFixture trait
+    // implementation. Forces the compiler to verify that each dependency path resolves
+    // to a concrete type implementing AcyclicFixture, preventing cycles introduced
+    // by path aliases or re-exports.
+    let type_assertions = requires.iter().map(|dep| {
+        quote! {
+            const _: fn() = || {
+                fn _assert_acyclic<T: ?Sized + crucible_fixture_graph::AcyclicFixture>() {}
+                _assert_acyclic::<#dep>();
+            };
+        }
     });
 
     quote! {
@@ -325,6 +357,8 @@ fn dependency_graph_impl(
                 #where_clause
             {
             }
+
+            #(#type_assertions)*
         };
 
         impl #impl_generics #ident #ty_generics #where_clause {

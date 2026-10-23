@@ -2,12 +2,12 @@
 //!
 //! The service accepts already-measured Soroban contract invocation samples,
 //! validates a bounded workload, computes deterministic aggregate statistics,
-//! and stores a small in-memory history for operational inspection. It is
-//! intentionally independent from HTTP and persistence concerns so API handlers
-//! can remain thin and tests can exercise the domain logic directly.
+//! stores a bounded in-memory cache, and persists benchmark runs and baselines
+//! into PostgreSQL tables with an indexed schema for historical time-series queries (#1212).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -24,6 +24,9 @@ pub enum ContractBenchmarkError {
     /// Request payload failed domain validation.
     #[error("validation error: {0}")]
     Validation(String),
+    /// Database persistence error.
+    #[error("database error: {0}")]
+    Database(String),
 }
 
 /// One measured contract operation invocation.
@@ -73,6 +76,10 @@ pub struct ContractBenchmarkThresholds {
     pub max_memory_regression_pct: f64,
     #[serde(default = "default_resource_fee_regression_threshold_pct")]
     pub max_resource_fee_regression_pct: f64,
+}
+
+fn default_resource_fee_regression_threshold_pct() -> f64 {
+    10.0
 }
 
 impl Default for ContractBenchmarkThresholds {
@@ -130,6 +137,34 @@ pub struct OperationBenchmarkSummary {
     pub total_ledger_space_rent_stroops: u64,
     pub total_resource_fee_stroops: u64,
     pub avg_resource_fee_stroops: f64,
+}
+
+impl OperationBenchmarkSummary {
+    /// Constructs an explicit zeroed summary for operations with empty samples (#1213).
+    pub fn zeroed(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            sample_count: 0,
+            success_rate: 0.0,
+            min_duration_us: 0,
+            avg_duration_us: 0.0,
+            p95_duration_us: 0,
+            max_duration_us: 0,
+            avg_cpu_instructions: 0.0,
+            total_cpu_instructions: 0,
+            avg_memory_bytes: 0.0,
+            peak_memory_bytes: 0,
+            total_ledger_read_entries: 0,
+            total_ledger_write_entries: 0,
+            total_ledger_read_bytes: 0,
+            total_ledger_write_bytes: 0,
+            total_transaction_size_bytes: 0,
+            total_events_return_bytes: 0,
+            total_ledger_space_rent_stroops: 0,
+            total_resource_fee_stroops: 0,
+            avg_resource_fee_stroops: 0.0,
+        }
+    }
 }
 
 /// Regression detail emitted when a metric exceeds its threshold.
@@ -203,6 +238,10 @@ impl OperationAccumulator {
     }
 
     fn into_summary(mut self, operation: String) -> OperationBenchmarkSummary {
+        if self.sample_count == 0 {
+            return OperationBenchmarkSummary::zeroed(operation);
+        }
+
         self.durations.sort_unstable();
         let p95_duration_us = percentile_nearest_rank(&self.durations, 95);
         let sample_count = self.sample_count as f64;
@@ -210,7 +249,7 @@ impl OperationAccumulator {
         OperationBenchmarkSummary {
             operation,
             sample_count: self.sample_count,
-            success_rate: self.success_count as f64 / sample_count,
+            success_rate: (self.success_count as f64 / sample_count).clamp(0.0, 1.0),
             min_duration_us: self.min_duration_us,
             avg_duration_us: self.total_duration_us as f64 / sample_count,
             p95_duration_us,
@@ -234,16 +273,83 @@ impl OperationAccumulator {
     }
 }
 
-/// Stateless benchmark calculator with bounded in-memory report history.
+/// Benchmark service with in-memory caching and optional PostgreSQL persistence (#1212).
 #[derive(Clone, Default)]
 pub struct ContractBenchmarkService {
     history: Arc<RwLock<HashMap<String, VecDeque<ContractBenchmarkReport>>>>,
+    pool: Option<PgPool>,
 }
 
 impl ContractBenchmarkService {
-    /// Creates a benchmark service.
+    /// Creates a benchmark service with in-memory storage.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a benchmark service backed by a PostgreSQL connection pool.
+    pub fn with_db(pool: PgPool) -> Self {
+        Self {
+            history: Arc::new(RwLock::new(HashMap::new())),
+            pool: Some(pool),
+        }
+    }
+
+    /// Attaches a PostgreSQL connection pool to an existing service instance.
+    pub fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Returns whether the service has an active database connection pool.
+    pub fn has_db(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// Initializes PostgreSQL tables and indexes for benchmark runs and baselines.
+    pub async fn init_schema(&self) -> Result<(), ContractBenchmarkError> {
+        if let Some(ref pool) = self.pool {
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS contract_benchmark_runs (
+                    id UUID PRIMARY KEY,
+                    contract_id TEXT NOT NULL,
+                    benchmark_name TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('passed', 'warning', 'failed')),
+                    sample_count BIGINT NOT NULL,
+                    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    overall_metrics JSONB NOT NULL,
+                    operations JSONB NOT NULL DEFAULT '[]',
+                    regressions JSONB NOT NULL DEFAULT '[]',
+                    baseline_metrics JSONB
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_benchmark_runs_contract_generated
+                    ON contract_benchmark_runs (contract_id, generated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_benchmark_runs_name_generated
+                    ON contract_benchmark_runs (benchmark_name, generated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_benchmark_runs_status
+                    ON contract_benchmark_runs (status);
+
+                CREATE TABLE IF NOT EXISTS contract_benchmark_baselines (
+                    contract_id TEXT NOT NULL,
+                    benchmark_name TEXT NOT NULL,
+                    p95_duration_us BIGINT NOT NULL,
+                    avg_cpu_instructions DOUBLE PRECISION NOT NULL,
+                    peak_memory_bytes BIGINT NOT NULL,
+                    avg_resource_fee_stroops DOUBLE PRECISION NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (contract_id, benchmark_name)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_benchmark_baselines_lookup
+                    ON contract_benchmark_baselines (contract_id, benchmark_name);
+                "#,
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Validates, aggregates, and records a contract benchmark report.
@@ -291,12 +397,30 @@ impl ContractBenchmarkService {
             regressions,
         };
 
-        self.record_report(report.clone()).await;
+        self.record_report(report.clone(), request.baseline.as_ref())
+            .await;
         Ok(report)
     }
 
     /// Returns recent reports for one contract, newest first.
+    /// If PostgreSQL pool is configured, loads from persistent storage; otherwise uses in-memory cache.
     pub async fn recent_reports(&self, contract_id: &str) -> Vec<ContractBenchmarkReport> {
+        if let Some(ref pool) = self.pool {
+            if let Ok(reports) = self
+                .query_historical_reports(
+                    pool,
+                    contract_id,
+                    Some(HISTORY_LIMIT_PER_CONTRACT as i64),
+                    None,
+                )
+                .await
+            {
+                if !reports.is_empty() {
+                    return reports;
+                }
+            }
+        }
+
         self.history
             .read()
             .await
@@ -305,13 +429,252 @@ impl ContractBenchmarkService {
             .unwrap_or_default()
     }
 
-    async fn record_report(&self, report: ContractBenchmarkReport) {
-        let mut history = self.history.write().await;
-        let reports = history.entry(report.contract_id.clone()).or_default();
-        reports.push_back(report);
-        while reports.len() > HISTORY_LIMIT_PER_CONTRACT {
-            reports.pop_front();
+    /// Queries historical benchmark reports from PostgreSQL time-series with optional limit and since filter.
+    pub async fn historical_reports(
+        &self,
+        contract_id: &str,
+        limit: Option<i64>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ContractBenchmarkReport>, ContractBenchmarkError> {
+        if let Some(ref pool) = self.pool {
+            self.query_historical_reports(pool, contract_id, limit, since)
+                .await
+        } else {
+            let history = self.history.read().await;
+            let reports = history.get(contract_id);
+            let mut filtered = match reports {
+                Some(entries) => entries
+                    .iter()
+                    .filter(|r| since.map(|s| r.generated_at >= s).unwrap_or(true))
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+            if let Some(lim) = limit {
+                filtered.truncate(lim.max(0) as usize);
+            }
+            Ok(filtered)
         }
+    }
+
+    /// Retrieves the latest saved baseline metrics for a contract and benchmark.
+    pub async fn get_baseline(
+        &self,
+        contract_id: &str,
+        benchmark_name: &str,
+    ) -> Result<Option<ContractBenchmarkBaseline>, ContractBenchmarkError> {
+        if let Some(ref pool) = self.pool {
+            let row_opt = sqlx::query(
+                r#"
+                SELECT p95_duration_us, avg_cpu_instructions, peak_memory_bytes, avg_resource_fee_stroops
+                FROM contract_benchmark_baselines
+                WHERE contract_id = $1 AND benchmark_name = $2
+                "#,
+            )
+            .bind(contract_id)
+            .bind(benchmark_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+
+            if let Some(row) = row_opt {
+                let p95: i64 = row
+                    .try_get("p95_duration_us")
+                    .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+                let avg_cpu: f64 = row
+                    .try_get("avg_cpu_instructions")
+                    .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+                let peak_mem: i64 = row
+                    .try_get("peak_memory_bytes")
+                    .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+                let avg_fee: f64 = row
+                    .try_get("avg_resource_fee_stroops")
+                    .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+
+                return Ok(Some(ContractBenchmarkBaseline {
+                    p95_duration_us: p95 as u64,
+                    avg_cpu_instructions: avg_cpu,
+                    peak_memory_bytes: peak_mem as u64,
+                    avg_resource_fee_stroops: avg_fee,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn record_report(
+        &self,
+        report: ContractBenchmarkReport,
+        baseline: Option<&ContractBenchmarkBaseline>,
+    ) {
+        {
+            let mut history = self.history.write().await;
+            let reports = history.entry(report.contract_id.clone()).or_default();
+            reports.push_back(report.clone());
+            while reports.len() > HISTORY_LIMIT_PER_CONTRACT {
+                reports.pop_front();
+            }
+        }
+
+        if let Some(ref pool) = self.pool {
+            let overall_json = serde_json::to_value(&report.overall).unwrap_or_default();
+            let operations_json = serde_json::to_value(&report.operations).unwrap_or_default();
+            let regressions_json = serde_json::to_value(&report.regressions).unwrap_or_default();
+            let baseline_json = baseline.map(|b| serde_json::to_value(b).unwrap_or_default());
+            let status_str = match report.status {
+                BenchmarkStatus::Passed => "passed",
+                BenchmarkStatus::Warning => "warning",
+                BenchmarkStatus::Failed => "failed",
+            };
+
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO contract_benchmark_runs (
+                    id, contract_id, benchmark_name, status, sample_count,
+                    generated_at, overall_metrics, operations, regressions, baseline_metrics
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (id) DO NOTHING
+                "#,
+            )
+            .bind(report.benchmark_id)
+            .bind(&report.contract_id)
+            .bind(&report.benchmark_name)
+            .bind(status_str)
+            .bind(report.sample_count as i64)
+            .bind(report.generated_at)
+            .bind(overall_json)
+            .bind(operations_json)
+            .bind(regressions_json)
+            .bind(baseline_json)
+            .execute(pool)
+            .await;
+
+            if let Some(b) = baseline {
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO contract_benchmark_baselines (
+                        contract_id, benchmark_name, p95_duration_us, avg_cpu_instructions,
+                        peak_memory_bytes, avg_resource_fee_stroops, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    ON CONFLICT (contract_id, benchmark_name) DO UPDATE SET
+                        p95_duration_us = EXCLUDED.p95_duration_us,
+                        avg_cpu_instructions = EXCLUDED.avg_cpu_instructions,
+                        peak_memory_bytes = EXCLUDED.peak_memory_bytes,
+                        avg_resource_fee_stroops = EXCLUDED.avg_resource_fee_stroops,
+                        updated_at = NOW()
+                    "#,
+                )
+                .bind(&report.contract_id)
+                .bind(&report.benchmark_name)
+                .bind(b.p95_duration_us as i64)
+                .bind(b.avg_cpu_instructions)
+                .bind(b.peak_memory_bytes as i64)
+                .bind(b.avg_resource_fee_stroops)
+                .execute(pool)
+                .await;
+            }
+        }
+    }
+
+    async fn query_historical_reports(
+        &self,
+        pool: &PgPool,
+        contract_id: &str,
+        limit: Option<i64>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ContractBenchmarkReport>, ContractBenchmarkError> {
+        let limit_val = limit.unwrap_or(50).clamp(1, 1000);
+        let rows = if let Some(since_dt) = since {
+            sqlx::query(
+                r#"
+                SELECT id, contract_id, benchmark_name, status, sample_count,
+                       generated_at, overall_metrics, operations, regressions
+                FROM contract_benchmark_runs
+                WHERE contract_id = $1 AND generated_at >= $2
+                ORDER BY generated_at DESC
+                LIMIT $3
+                "#,
+            )
+            .bind(contract_id)
+            .bind(since_dt)
+            .bind(limit_val)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, contract_id, benchmark_name, status, sample_count,
+                       generated_at, overall_metrics, operations, regressions
+                FROM contract_benchmark_runs
+                WHERE contract_id = $1
+                ORDER BY generated_at DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(contract_id)
+            .bind(limit_val)
+            .fetch_all(pool)
+            .await
+        }
+        .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+
+        let mut reports = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: Uuid = row
+                .try_get("id")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let cid: String = row
+                .try_get("contract_id")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let bname: String = row
+                .try_get("benchmark_name")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let status_str: String = row
+                .try_get("status")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let sample_count: i64 = row
+                .try_get("sample_count")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let generated_at: DateTime<Utc> = row
+                .try_get("generated_at")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let overall_val: serde_json::Value = row
+                .try_get("overall_metrics")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let operations_val: serde_json::Value = row
+                .try_get("operations")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let regressions_val: serde_json::Value = row
+                .try_get("regressions")
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+
+            let status = match status_str.as_str() {
+                "passed" => BenchmarkStatus::Passed,
+                "warning" => BenchmarkStatus::Warning,
+                _ => BenchmarkStatus::Failed,
+            };
+            let overall: OperationBenchmarkSummary = serde_json::from_value(overall_val)
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let operations: Vec<OperationBenchmarkSummary> = serde_json::from_value(operations_val)
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+            let regressions: Vec<BenchmarkRegression> = serde_json::from_value(regressions_val)
+                .map_err(|e| ContractBenchmarkError::Database(e.to_string()))?;
+
+            reports.push(ContractBenchmarkReport {
+                benchmark_id: id,
+                contract_id: cid,
+                benchmark_name: bname,
+                status,
+                sample_count: sample_count as u64,
+                generated_at,
+                operations,
+                overall,
+                regressions,
+            });
+        }
+
+        Ok(reports)
     }
 }
 
@@ -355,30 +718,33 @@ fn validate_request(request: &ContractBenchmarkRequest) -> Result<(), ContractBe
         )?;
     }
 
-    for sample in &request.samples {
-        validate_identifier("operation", &sample.operation)?;
+    for (index, sample) in request.samples.iter().enumerate() {
+        validate_identifier(&format!("samples[{index}].operation"), &sample.operation)?;
     }
 
     Ok(())
 }
 
-fn default_resource_fee_regression_threshold_pct() -> f64 {
-    10.0
-}
-
 fn validate_identifier(field: &str, value: &str) -> Result<(), ContractBenchmarkError> {
-    if value.is_empty() || value.len() > MAX_ID_LEN {
+    if value.trim().is_empty() {
         return Err(ContractBenchmarkError::Validation(format!(
-            "{field} must be between 1 and {MAX_ID_LEN} characters"
+            "{field} cannot be empty"
         )));
     }
 
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.'))
-    {
+    if value.len() > MAX_ID_LEN {
         return Err(ContractBenchmarkError::Validation(format!(
-            "{field} may contain only letters, numbers, '_', '-', ':' or '.'"
+            "{field} exceeds max length of {MAX_ID_LEN} bytes"
+        )));
+    }
+
+    let is_valid = value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-');
+
+    if !is_valid {
+        return Err(ContractBenchmarkError::Validation(format!(
+            "{field} may contain only ASCII alphanumeric characters, underscores, and dashes"
         )));
     }
 
@@ -386,30 +752,37 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), ContractBenchmark
 }
 
 fn validate_percentage(field: &str, value: f64) -> Result<(), ContractBenchmarkError> {
-    validate_non_negative_finite(field, value).map_err(|_| {
-        ContractBenchmarkError::Validation(format!(
-            "{field} must be a finite percentage greater than or equal to 0"
-        ))
-    })
+    if !value.is_finite() || value < 0.0 || value > 1_000.0 {
+        return Err(ContractBenchmarkError::Validation(format!(
+            "{field} must be a finite percentage between 0 and 1000"
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_non_negative_finite(field: &str, value: f64) -> Result<(), ContractBenchmarkError> {
-    if value.is_finite() && value >= 0.0 {
-        return Ok(());
+    if !value.is_finite() || value < 0.0 {
+        return Err(ContractBenchmarkError::Validation(format!(
+            "{field} must be finite and non-negative"
+        )));
     }
 
-    Err(ContractBenchmarkError::Validation(format!(
-        "{field} must be finite and greater than or equal to 0"
-    )))
+    Ok(())
 }
 
-fn percentile_nearest_rank(sorted_values: &[u64], percentile: usize) -> u64 {
-    let rank = (percentile * sorted_values.len()).div_ceil(100);
-    sorted_values[rank.saturating_sub(1)]
+fn percentile_nearest_rank(sorted: &[u64], percentile: u8) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+
+    let rank = ((f64::from(percentile) / 100.0) * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
 }
 
 fn saturating_u128_to_u64(value: u128) -> u64 {
-    value.min(u128::from(u64::MAX)) as u64
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn compare_baseline(
@@ -417,30 +790,30 @@ fn compare_baseline(
     baseline: &ContractBenchmarkBaseline,
     thresholds: ContractBenchmarkThresholds,
 ) -> Vec<BenchmarkRegression> {
-    let mut regressions = Vec::with_capacity(3);
+    let mut regressions = Vec::new();
 
-    push_regression(
+    check_metric(
         &mut regressions,
         "p95_duration_us",
         baseline.p95_duration_us as f64,
         overall.p95_duration_us as f64,
         thresholds.max_p95_latency_regression_pct,
     );
-    push_regression(
+    check_metric(
         &mut regressions,
         "avg_cpu_instructions",
         baseline.avg_cpu_instructions,
         overall.avg_cpu_instructions,
         thresholds.max_cpu_instruction_regression_pct,
     );
-    push_regression(
+    check_metric(
         &mut regressions,
         "peak_memory_bytes",
         baseline.peak_memory_bytes as f64,
         overall.peak_memory_bytes as f64,
         thresholds.max_memory_regression_pct,
     );
-    push_regression(
+    check_metric(
         &mut regressions,
         "avg_resource_fee_stroops",
         baseline.avg_resource_fee_stroops,
@@ -451,19 +824,19 @@ fn compare_baseline(
     regressions
 }
 
-fn push_regression(
+fn check_metric(
     regressions: &mut Vec<BenchmarkRegression>,
     metric: &str,
     baseline: f64,
     current: f64,
     threshold_pct: f64,
 ) {
-    if baseline <= 0.0 {
+    if !baseline.is_finite() || baseline <= 0.0 || !current.is_finite() {
         return;
     }
 
     let change_pct = ((current - baseline) / baseline) * 100.0;
-    if change_pct > threshold_pct {
+    if change_pct.is_finite() && change_pct > threshold_pct {
         regressions.push(BenchmarkRegression {
             metric: metric.to_string(),
             baseline,
@@ -667,5 +1040,107 @@ mod tests {
         assert_eq!(reports.len(), HISTORY_LIMIT_PER_CONTRACT);
         assert_eq!(reports[0].benchmark_name, "run_59");
         assert_eq!(reports[49].benchmark_name, "run_10");
+    }
+
+    #[test]
+    fn test_empty_accumulator_produces_zeroed_summary_without_nan() {
+        let acc = OperationAccumulator::default();
+        let summary = acc.into_summary("empty_op".to_string());
+
+        assert_eq!(summary.operation, "empty_op");
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.success_rate, 0.0);
+        assert_eq!(summary.avg_duration_us, 0.0);
+        assert_eq!(summary.avg_cpu_instructions, 0.0);
+        assert_eq!(summary.avg_memory_bytes, 0.0);
+        assert_eq!(summary.avg_resource_fee_stroops, 0.0);
+
+        // Verify that this summary serializes cleanly to JSON without NaN errors
+        let json_str = serde_json::to_string(&summary);
+        assert!(json_str.is_ok());
+        let val: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
+        assert_eq!(val["sample_count"], 0);
+        assert_eq!(val["avg_duration_us"], 0.0);
+    }
+
+    #[test]
+    fn test_operation_benchmark_summary_zeroed_helper() {
+        let summary = OperationBenchmarkSummary::zeroed("custom_zero");
+        assert_eq!(summary.operation, "custom_zero");
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.avg_duration_us, 0.0);
+        assert!(summary.avg_duration_us.is_finite());
+        assert!(!summary.avg_duration_us.is_nan());
+    }
+
+    #[test]
+    fn test_push_regression_guards_against_nan_and_zero_baseline() {
+        let mut regressions = Vec::new();
+        check_metric(&mut regressions, "test_metric", 0.0, 100.0, 10.0);
+        assert!(regressions.is_empty());
+
+        check_metric(&mut regressions, "test_metric", f64::NAN, 100.0, 10.0);
+        assert!(regressions.is_empty());
+
+        check_metric(&mut regressions, "test_metric", 100.0, f64::NAN, 10.0);
+        assert!(regressions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn benchmark_historical_reports_with_time_series_filter() {
+        let service = ContractBenchmarkService::new();
+        let start_time = Utc::now();
+
+        for index in 0..5 {
+            let mut req = request(vec![sample("op", 10, 100)]);
+            req.benchmark_name = format!("bench_{index}");
+            service.run_benchmark(req).await.unwrap();
+        }
+
+        let all_hist = service
+            .historical_reports("counter", Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(all_hist.len(), 5);
+
+        let limited = service
+            .historical_reports("counter", Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].benchmark_name, "bench_4");
+        assert_eq!(limited[1].benchmark_name, "bench_3");
+
+        let filtered_since = service
+            .historical_reports("counter", None, Some(start_time))
+            .await
+            .unwrap();
+        assert_eq!(filtered_since.len(), 5);
+
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let future_filtered = service
+            .historical_reports("counter", None, Some(future))
+            .await
+            .unwrap();
+        assert_eq!(future_filtered.len(), 0);
+    }
+
+    #[test]
+    fn test_benchmark_report_json_roundtrip_for_db_jsonb() {
+        let service = ContractBenchmarkService::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let report = runtime.block_on(async {
+            service
+                .run_benchmark(request(vec![sample("inc", 42, 1024)]))
+                .await
+                .unwrap()
+        });
+
+        let json_val = serde_json::to_value(&report).unwrap();
+        let deserialized: ContractBenchmarkReport = serde_json::from_value(json_val).unwrap();
+
+        assert_eq!(deserialized.benchmark_id, report.benchmark_id);
+        assert_eq!(deserialized.contract_id, report.contract_id);
+        assert_eq!(deserialized.overall.min_duration_us, 42);
     }
 }

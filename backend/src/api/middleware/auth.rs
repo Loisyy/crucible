@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -51,6 +51,7 @@ pub struct Principal {
     pub id: i32,
     pub address: String,
     pub role: Role,
+    pub organization_id: Option<i32>,
 }
 
 impl Principal {
@@ -60,7 +61,14 @@ impl Principal {
             id,
             address: address.into(),
             role: Role::Admin,
+            organization_id: None,
         }
+    }
+
+    /// Attach an organization / tenant ID to this principal.
+    pub fn with_org(mut self, org_id: i32) -> Self {
+        self.organization_id = Some(org_id);
+        self
     }
 
     fn to_auth_user(&self) -> AuthUser {
@@ -68,23 +76,34 @@ impl Principal {
             id: self.id,
             address: self.address.clone(),
             role: self.role,
+            organization_id: self.organization_id,
+            permissions: Some(self.role.default_permissions()),
         }
     }
 }
 
 /// Claims extracted from a verified HS256 JWT access token.
 #[derive(Debug, Clone, Deserialize)]
-struct JwtClaims {
+pub(crate) struct JwtClaims {
     /// JWT ID — used for Redis revocation lookups.
-    jti: Option<String>,
+    pub(crate) jti: Option<String>,
     /// Expiration as seconds since the Unix epoch.
-    exp: Option<i64>,
+    pub(crate) exp: Option<i64>,
     /// Optional subject / user id.
     #[serde(default)]
-    sub: Option<String>,
+    pub(crate) sub: Option<String>,
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
-    role: Option<String>,
+    pub(crate) role: Option<String>,
+    /// Optional organization / tenant ID claim.
+    #[serde(default)]
+    pub(crate) org_id: Option<i32>,
+    /// Optional issuer claim (`iss`).
+    #[serde(default)]
+    pub(crate) iss: Option<String>,
+    /// Optional audience claim (`aud`).
+    #[serde(default)]
+    pub(crate) aud: Option<String>,
 }
 
 /// Registry mapping bearer tokens to the principals they authenticate, plus
@@ -98,6 +117,10 @@ pub struct AdminAuthState {
     /// HS256 secret used to verify JWT bearer tokens. When unset, only the
     /// static token registry is consulted.
     jwt_secret: Option<String>,
+    /// Expected issuer claim (`iss`) for JWT verification.
+    jwt_issuer: Option<String>,
+    /// Expected audience claim (`aud`) for JWT verification.
+    jwt_audience: Option<String>,
     /// Redis client used for `jti` blocklist lookups. When unset, JWT
     /// revocation checks are skipped (signature/expiry are still enforced).
     redis: Option<redis::Client>,
@@ -124,6 +147,24 @@ impl AdminAuthState {
         self
     }
 
+    /// Attach the expected JWT issuer claim (`iss`).
+    pub fn with_jwt_issuer(mut self, issuer: impl Into<String>) -> Self {
+        let issuer = issuer.into();
+        if !issuer.trim().is_empty() {
+            self.jwt_issuer = Some(issuer);
+        }
+        self
+    }
+
+    /// Attach the expected JWT audience claim (`aud`).
+    pub fn with_jwt_audience(mut self, audience: impl Into<String>) -> Self {
+        let audience = audience.into();
+        if !audience.trim().is_empty() {
+            self.jwt_audience = Some(audience);
+        }
+        self
+    }
+
     /// Build a registry from environment variables.
     ///
     /// * `ADMIN_API_TOKEN` — grants [`Role::Admin`] (required to reach
@@ -142,8 +183,7 @@ impl AdminAuthState {
             }
             _ => {
                 warn!(
-                    "ADMIN_API_TOKEN is not set; privileged admin/config endpoints \
-                     are locked down and will reject all requests"
+                    "ADMIN_API_TOKEN is not set; privileged admin/config endpoints                      are locked down and will reject all requests"
                 );
             }
         }
@@ -156,6 +196,7 @@ impl AdminAuthState {
                         id: 2,
                         address: "operator".to_string(),
                         role: Role::User,
+                        organization_id: None,
                     },
                 );
             }
@@ -163,6 +204,14 @@ impl AdminAuthState {
 
         if let Ok(secret) = std::env::var("JWT_SECRET") {
             state = state.with_jwt_secret(secret);
+        }
+
+        if let Ok(issuer) = std::env::var("JWT_ISSUER") {
+            state = state.with_jwt_issuer(issuer);
+        }
+
+        if let Ok(audience) = std::env::var("JWT_AUDIENCE") {
+            state = state.with_jwt_audience(audience);
         }
 
         if let Ok(url) = std::env::var("REDIS_URL") {
@@ -203,21 +252,100 @@ impl AdminAuthState {
             }
         }
     }
+
+    /// Check whether a token is valid (either as a registered static token or valid JWT).
+    pub async fn is_token_valid(&self, token: &str) -> bool {
+        if self.tokens.contains_key(token) {
+            return true;
+        }
+
+        if let Some(secret) = self.jwt_secret.as_deref() {
+            if let Some(claims) = verify_hs256_jwt(
+                token,
+                secret,
+                self.jwt_issuer.as_deref(),
+                self.jwt_audience.as_deref(),
+            ) {
+                if let Some(jti) = claims.jti.as_deref() {
+                    if self.is_jti_revoked(jti).await {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+/// Errors that can occur when extracting or validating the `Authorization` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthHeaderError {
+    /// The Authorization header was missing from the request.
+    Missing,
+    /// The Authorization header contained non-ASCII / invalid character bytes.
+    NonAscii,
+    /// The Authorization header was missing the required `Bearer ` prefix.
+    MissingBearerPrefix,
+    /// The Bearer token was empty or contained only whitespace.
+    EmptyToken,
+}
+
+impl std::fmt::Display for AuthHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "Authentication required: missing Authorization header"),
+            Self::NonAscii => write!(
+                f,
+                "Malformed Authorization header: contains non-ASCII characters"
+            ),
+            Self::MissingBearerPrefix => {
+                write!(
+                    f,
+                    "Malformed Authorization header: missing 'Bearer ' prefix"
+                )
+            }
+            Self::EmptyToken => write!(f, "Malformed Authorization header: empty bearer token"),
+        }
+    }
+}
+
+impl std::error::Error for AuthHeaderError {}
+
+/// Gracefully extract the bearer token from the `Authorization` header, returning
+/// a descriptive [`AuthHeaderError`] if the header is malformed.
+pub fn extract_bearer_token(request: &Request) -> Result<String, AuthHeaderError> {
+    let header_value = match request.headers().get(header::AUTHORIZATION) {
+        Some(val) => val,
+        None => return Err(AuthHeaderError::Missing),
+    };
+
+    let header_str = match header_value.to_str() {
+        Ok(s) => s,
+        Err(_) => return Err(AuthHeaderError::NonAscii),
+    };
+
+    let trimmed = header_str.trim();
+    if !trimmed.starts_with("Bearer ") {
+        return Err(AuthHeaderError::MissingBearerPrefix);
+    }
+
+    let token = trimmed["Bearer ".len()..].trim();
+    if token.is_empty() {
+        return Err(AuthHeaderError::EmptyToken);
+    }
+
+    Ok(token.to_string())
 }
 
 /// Extract the bearer token from the `Authorization` header, if well-formed.
 fn bearer_token(request: &Request) -> Option<String> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = value.strip_prefix("Bearer ")?.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
+    extract_bearer_token(request).ok()
 }
 
 fn reject(status: StatusCode, code: &str, message: &str) -> Response {
-    crate::api::errors::make_error_response(status, code, message)
+    crate::api::errors::make_problem_response(status, code, message)
 }
 
 fn b64url_decode(input: &str) -> Option<Vec<u8>> {
@@ -228,7 +356,13 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Verify an HS256 JWT and return its claims, or `None` on any failure.
-fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
+/// When `expected_issuer` or `expected_audience` are specified, matching claims are strictly required.
+pub(crate) fn verify_hs256_jwt(
+    token: &str,
+    secret: &str,
+    expected_issuer: Option<&str>,
+    expected_audience: Option<&str>,
+) -> Option<JwtClaims> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -242,7 +376,7 @@ fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
     mac.update(signing_input.as_bytes());
     let expected = mac.finalize().into_bytes();
     let actual = b64url_decode(signature)?;
-    if expected.as_ref() != actual.as_slice() {
+    if expected.as_slice() != actual.as_slice() {
         return None;
     }
 
@@ -252,6 +386,18 @@ fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
     if let Some(exp) = claims.exp {
         let now = chrono::Utc::now().timestamp();
         if now >= exp {
+            return None;
+        }
+    }
+
+    if let Some(expected_iss) = expected_issuer {
+        if claims.iss.as_deref() != Some(expected_iss) {
+            return None;
+        }
+    }
+
+    if let Some(expected_aud) = expected_audience {
+        if claims.aud.as_deref() != Some(expected_aud) {
             return None;
         }
     }
@@ -284,6 +430,7 @@ fn principal_from_jwt_claims(claims: &JwtClaims) -> Principal {
         id,
         address,
         role: role_from_claim(claims.role.as_deref()),
+        organization_id: claims.org_id,
     }
 }
 
@@ -299,13 +446,30 @@ pub async fn require_admin_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = bearer_token(&request) else {
-        debug!("Privileged request rejected: missing bearer token");
-        return reject(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Authentication required: provide a Bearer token",
-        );
+    let token = match extract_bearer_token(&request) {
+        Ok(t) => t,
+        Err(err) => {
+            warn!(error = %err, "Privileged request rejected: malformed or missing authorization header");
+            let (code, message) = match err {
+                AuthHeaderError::Missing => (
+                    "unauthorized",
+                    "Authentication required: provide a Bearer token",
+                ),
+                AuthHeaderError::NonAscii => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: contains non-ASCII characters",
+                ),
+                AuthHeaderError::MissingBearerPrefix => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: expected 'Bearer <token>'",
+                ),
+                AuthHeaderError::EmptyToken => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: empty bearer token",
+                ),
+            };
+            return reject(StatusCode::UNAUTHORIZED, code, message);
+        }
     };
 
     // Static registry tokens (provisioned via env) take precedence.
@@ -313,9 +477,14 @@ pub async fn require_admin_auth(
         return authorize_principal(principal, request, next).await;
     }
 
-    // JWT path: verify signature/expiry, then consult the Redis jti blocklist.
+    // JWT path: verify signature/expiry/iss/aud, then consult the Redis jti blocklist.
     if let Some(secret) = auth.jwt_secret.as_deref() {
-        if let Some(claims) = verify_hs256_jwt(&token, secret) {
+        if let Some(claims) = verify_hs256_jwt(
+            &token,
+            secret,
+            auth.jwt_issuer.as_deref(),
+            auth.jwt_audience.as_deref(),
+        ) {
             if let Some(jti) = claims.jti.as_deref() {
                 if auth.is_jti_revoked(jti).await {
                     warn!(jti, "Privileged request rejected: JWT jti is revoked");
@@ -388,22 +557,26 @@ mod tests {
     }
 
     fn guarded_app(auth: AdminAuthState) -> Router {
-        Router::new().route("/admin", get(|| async { "ok" })).route_layer(
-            middleware::from_fn_with_state(Arc::new(auth), require_admin_auth),
-        )
+        Router::new()
+            .route("/admin", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::new(auth),
+                require_admin_auth,
+            ))
     }
 
-    async fn status_for(auth_header: Option<&str>) -> StatusCode {
+    async fn response_for(auth_header: Option<HeaderValue>) -> Response {
         let mut builder = Request::builder().uri("/admin");
         if let Some(value) = auth_header {
             builder = builder.header(header::AUTHORIZATION, value);
         }
         let request = builder.body(Body::empty()).unwrap();
-        guarded_app(registry())
-            .oneshot(request)
-            .await
-            .unwrap()
-            .status()
+        guarded_app(registry()).oneshot(request).await.unwrap()
+    }
+
+    async fn status_for(auth_header: Option<&str>) -> StatusCode {
+        let header_val = auth_header.map(|s| HeaderValue::from_str(s).unwrap());
+        response_for(header_val).await.status()
     }
 
     fn sign_jwt(secret: &str, payload_json: &str) -> String {
@@ -413,20 +586,49 @@ mod tests {
         let signing_input = format!("{header}.{payload}");
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(signing_input.as_bytes());
-        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         format!("{signing_input}.{sig}")
     }
 
     #[tokio::test]
     async fn unauthenticated_request_is_rejected() {
-        assert_eq!(status_for(None).await, StatusCode::UNAUTHORIZED);
+        let resp = response_for(None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
     }
 
     #[tokio::test]
     async fn malformed_header_is_rejected() {
+        let resp = response_for(Some(HeaderValue::from_static("Basic abc"))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            status_for(Some("Basic abc")).await,
-            StatusCode::UNAUTHORIZED
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_header_with_non_ascii_is_rejected() {
+        let non_ascii_val = HeaderValue::from_bytes(b"Bearer \xFF\xFE\x01\x02").unwrap();
+        let resp = response_for(Some(non_ascii_val)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_header_with_empty_token_is_rejected() {
+        let resp = response_for(Some(HeaderValue::from_static("Bearer   "))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
         );
     }
 
@@ -440,9 +642,11 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_token_is_forbidden() {
+        let resp = response_for(Some(HeaderValue::from_static("Bearer operator-secret"))).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            status_for(Some("Bearer operator-secret")).await,
-            StatusCode::FORBIDDEN
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
         );
     }
 
@@ -451,6 +655,54 @@ mod tests {
         assert_eq!(
             status_for(Some("Bearer admin-secret")).await,
             StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_variants() {
+        let req_valid = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer test-token-123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_valid),
+            Ok("test-token-123".to_string())
+        );
+
+        let req_missing = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_missing),
+            Err(AuthHeaderError::Missing)
+        );
+
+        let req_non_ascii = Request::builder()
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_bytes(b"Bearer \x80\x81").unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_non_ascii),
+            Err(AuthHeaderError::NonAscii)
+        );
+
+        let req_basic = Request::builder()
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_basic),
+            Err(AuthHeaderError::MissingBearerPrefix)
+        );
+
+        let req_empty = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer   ")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_empty),
+            Err(AuthHeaderError::EmptyToken)
         );
     }
 
@@ -468,7 +720,7 @@ mod tests {
             secret,
             &format!(r#"{{"jti":"abc-123","exp":{exp},"sub":"1","role":"admin"}}"#),
         );
-        let claims = verify_hs256_jwt(&token, secret).expect("valid jwt");
+        let claims = verify_hs256_jwt(&token, secret, None, None).expect("valid jwt");
         assert_eq!(claims.jti.as_deref(), Some("abc-123"));
     }
 
@@ -477,7 +729,38 @@ mod tests {
         let secret = "test-secret";
         let exp = chrono::Utc::now().timestamp() - 10;
         let token = sign_jwt(secret, &format!(r#"{{"jti":"abc-123","exp":{exp}}}"#));
-        assert!(verify_hs256_jwt(&token, secret).is_none());
+        assert!(verify_hs256_jwt(&token, secret, None, None).is_none());
+    }
+
+    #[test]
+    fn verify_hs256_jwt_enforces_issuer_and_audience() {
+        let secret = "test-secret";
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let token = sign_jwt(
+            secret,
+            &format!(
+                r#"{{"jti":"iss-aud","exp":{exp},"iss":"crucible-auth","aud":"crucible-api"}}"#
+            ),
+        );
+
+        // Matching issuer and audience
+        assert!(
+            verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("crucible-api")).is_some()
+        );
+
+        // Mismatched issuer
+        assert!(
+            verify_hs256_jwt(&token, secret, Some("wrong-issuer"), Some("crucible-api")).is_none()
+        );
+
+        // Mismatched audience
+        assert!(verify_hs256_jwt(
+            &token,
+            secret,
+            Some("crucible-auth"),
+            Some("wrong-audience")
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -496,5 +779,54 @@ mod tests {
             .unwrap();
         let status = guarded_app(auth).oneshot(request).await.unwrap().status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_admin_token_enforces_configured_issuer_and_audience() {
+        let secret = "jwt-secret";
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let valid_token = sign_jwt(
+            secret,
+            &format!(
+                r#"{{"jti":"valid-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-prod","aud":"crucible-admin"}}"#
+            ),
+        );
+        let staging_token = sign_jwt(
+            secret,
+            &format!(
+                r#"{{"jti":"staging-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-staging","aud":"crucible-admin"}}"#
+            ),
+        );
+
+        let auth = AdminAuthState::new()
+            .with_jwt_secret(secret)
+            .with_jwt_issuer("crucible-prod")
+            .with_jwt_audience("crucible-admin");
+
+        // Valid prod token succeeds
+        let req_valid = Request::builder()
+            .uri("/admin")
+            .header(header::AUTHORIZATION, format!("Bearer {valid_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let status_valid = guarded_app(auth.clone())
+            .oneshot(req_valid)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status_valid, StatusCode::OK);
+
+        // Staging token with wrong issuer rejected
+        let req_staging = Request::builder()
+            .uri("/admin")
+            .header(header::AUTHORIZATION, format!("Bearer {staging_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let status_staging = guarded_app(auth)
+            .oneshot(req_staging)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status_staging, StatusCode::UNAUTHORIZED);
     }
 }

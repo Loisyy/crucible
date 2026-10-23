@@ -50,6 +50,16 @@ impl ShutdownCoordinator {
         self.shutdown_tx.subscribe()
     }
 
+    /// Returns true if graceful shutdown has already been initiated.
+    pub fn is_shutting_down(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
+    /// Broadcasts shutdown signal to all background workers without waiting.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
     /// Register a handle of a running background task.
     pub async fn register(&self, handle: tokio::task::JoinHandle<()>) {
         self.active_tasks.lock().await.push(handle);

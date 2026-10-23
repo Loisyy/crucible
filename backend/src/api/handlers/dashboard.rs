@@ -106,12 +106,30 @@ pub struct DashboardMetrics {
 }
 
 /// Contract-specific usage metrics.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct ContractStats {
     pub contract_id: String,
     pub invocation_count: u64,
     pub last_invoked: Option<DateTime<Utc>>,
     pub avg_gas_cost: f64,
+}
+
+/// Request payload for batch contract stats aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BatchContractStatsRequest {
+    pub contract_ids: Vec<String>,
+}
+
+/// Query parameters for batch contract stats aggregation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchContractStatsQuery {
+    pub contract_ids: Option<String>,
+}
+
+/// Aggregated response containing batched contract statistics.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct BatchContractStatsResponse {
+    pub stats: Vec<ContractStats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +237,54 @@ pub async fn get_dashboard_metrics(
     Ok(Json(metrics))
 }
 
+/// Query aggregated stats for a batch of contract IDs using a single consolidated SQL query
+/// with `GROUP BY` and window ranking, eliminating N+1 database queries.
+pub async fn fetch_batch_contract_stats(
+    pool: &PgPool,
+    contract_ids: &[String],
+) -> Result<Vec<ContractStats>, DashboardError> {
+    if contract_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Consolidated query joining contracts and transactions with GROUP BY and window function:
+    // Computes invocation count, last invoked timestamp, and average gas cost for all requested contracts in a single pass.
+    let rows: Vec<(String, i64, Option<DateTime<Utc>>, Option<f64>)> = sqlx::query_as(
+        r#"
+        WITH aggregated AS (
+            SELECT 
+                c.contract_id,
+                COUNT(t.id) AS invocation_count,
+                MAX(t.created_at) AS last_invoked,
+                AVG(t.gas_cost) AS avg_gas_cost,
+                ROW_NUMBER() OVER (PARTITION BY c.contract_id ORDER BY MAX(t.created_at) DESC NULLS LAST) AS _rn
+            FROM contracts c
+            LEFT JOIN transactions t ON c.contract_id = t.contract_id
+            WHERE c.contract_id = ANY($1)
+            GROUP BY c.contract_id
+        )
+        SELECT contract_id, invocation_count, last_invoked, avg_gas_cost
+        FROM aggregated
+        ORDER BY contract_id ASC
+        "#,
+    )
+    .bind(contract_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let stats = rows
+        .into_iter()
+        .map(|(contract_id, count, last_invoked, avg_gas)| ContractStats {
+            contract_id,
+            invocation_count: count as u64,
+            last_invoked,
+            avg_gas_cost: avg_gas.unwrap_or(0.0),
+        })
+        .collect();
+
+    Ok(stats)
+}
+
 /// `GET /api/v1/dashboard/contracts/:contract_id/stats` — return contract usage statistics.
 #[utoipa::path(
     get,
@@ -245,37 +311,110 @@ pub async fn get_contract_stats(
         Err(e) => warn!(error = %e, contract_id = %contract_id, "Contract stats cache read failed; falling back to live data"),
     }
 
-    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM contracts WHERE contract_id = $1")
-        .bind(&contract_id)
-        .fetch_optional(&state.db)
-        .await?;
-
-    if exists.is_none() {
-        return Err(DashboardError::NotFound(format!(
-            "Contract {contract_id} not found"
-        )));
-    }
-
-    let (invocation_count, last_invoked, avg_gas_cost): (i64, Option<DateTime<Utc>>, Option<f64>) =
-        sqlx::query_as(
-            "SELECT COUNT(*), MAX(created_at), AVG(gas_cost) FROM transactions WHERE contract_id = $1",
-        )
-        .bind(&contract_id)
-        .fetch_one(&state.db)
-        .await?;
-
-    let stats = ContractStats {
-        contract_id,
-        invocation_count: invocation_count as u64,
-        last_invoked,
-        avg_gas_cost: avg_gas_cost.unwrap_or(0.0),
-    };
+    let batch = fetch_batch_contract_stats(&state.db, &[contract_id.clone()]).await?;
+    let stats = batch.into_iter().next().ok_or_else(|| {
+        DashboardError::NotFound(format!("Contract {contract_id} not found"))
+    })?;
 
     if let Err(e) = try_cache_set(&state.redis, &cache_key, &stats).await {
         warn!(error = %e, contract_id = %stats.contract_id, "Failed to populate contract stats cache");
     }
 
     Ok(Json(stats))
+}
+
+/// `POST /api/v1/dashboard/contracts/stats/batch` — return batch contract usage statistics in a single request.
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboard/contracts/stats/batch",
+    request_body = BatchContractStatsRequest,
+    responses(
+        (status = 200, description = "Batch contract stats", body = BatchContractStatsResponse)
+    ),
+    tag = "dashboard"
+)]
+#[tracing::instrument(skip(state))]
+pub async fn get_batch_contract_stats(
+    State(state): State<Arc<DashboardState>>,
+    Json(payload): Json<BatchContractStatsRequest>,
+) -> Result<impl IntoResponse, DashboardError> {
+    let stats = get_batch_contract_stats_inner(&state, payload.contract_ids).await?;
+    Ok(Json(BatchContractStatsResponse { stats }))
+}
+
+/// `GET /api/v1/dashboard/contracts/stats` — return batch contract usage statistics via query string.
+#[tracing::instrument(skip(state))]
+pub async fn get_batch_contract_stats_query(
+    State(state): State<Arc<DashboardState>>,
+    axum::extract::Query(query): axum::extract::Query<BatchContractStatsQuery>,
+) -> Result<impl IntoResponse, DashboardError> {
+    let contract_ids = query
+        .contract_ids
+        .map(|s| {
+            s.split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let stats = get_batch_contract_stats_inner(&state, contract_ids).await?;
+    Ok(Json(BatchContractStatsResponse { stats }))
+}
+
+async fn get_batch_contract_stats_inner(
+    state: &DashboardState,
+    contract_ids: Vec<String>,
+) -> Result<Vec<ContractStats>, DashboardError> {
+    if contract_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut unique_ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in contract_ids {
+        if seen.insert(id.clone()) {
+            unique_ids.push(id);
+        }
+    }
+
+    let mut results: Vec<ContractStats> = Vec::with_capacity(unique_ids.len());
+    let mut uncached_ids: Vec<String> = Vec::new();
+
+    // Check Redis cache for each contract
+    for id in &unique_ids {
+        let cache_key = format!("dashboard:contract_stats:{id}");
+        match try_cache_get::<ContractStats>(&state.redis, &cache_key).await {
+            Ok(Some(cached)) => {
+                results.push(cached);
+            }
+            Ok(None) => {
+                uncached_ids.push(id.clone());
+            }
+            Err(e) => {
+                warn!(error = %e, contract_id = %id, "Contract stats cache read failed; fetching live");
+                uncached_ids.push(id.clone());
+            }
+        }
+    }
+
+    // Single consolidated SQL query for all cache misses
+    if !uncached_ids.is_empty() {
+        let fetched = fetch_batch_contract_stats(&state.db, &uncached_ids).await?;
+
+        for stats in fetched {
+            let cache_key = format!("dashboard:contract_stats:{}", stats.contract_id);
+            if let Err(e) = try_cache_set(&state.redis, &cache_key, &stats).await {
+                warn!(error = %e, contract_id = %stats.contract_id, "Failed to populate contract stats cache");
+            }
+            results.push(stats);
+        }
+    }
+
+    // Deterministic sort order by contract_id
+    results.sort_by(|a, b| a.contract_id.cmp(&b.contract_id));
+
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,5 +588,93 @@ mod tests {
         let back: DashboardData = serde_json::from_str(&json).unwrap();
         assert_eq!(back.active_recovery_tasks.len(), 0);
         assert_eq!(back.active_alerts.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_contract_stats_empty_request() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/api/dashboard/contracts/stats/batch",
+                axum::routing::post(get_batch_contract_stats),
+            )
+            .with_state(state);
+
+        let req_body = serde_json::to_vec(&BatchContractStatsRequest {
+            contract_ids: vec![],
+        })
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dashboard/contracts/stats/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp: BatchContractStatsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.stats.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_contract_stats_query_empty() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/api/dashboard/contracts/stats",
+                axum::routing::get(get_batch_contract_stats_query),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/dashboard/contracts/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp: BatchContractStatsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.stats.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_contract_stats_roundtrip() {
+        let req = BatchContractStatsRequest {
+            contract_ids: vec!["c1".to_string(), "c2".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: BatchContractStatsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contract_ids, vec!["c1", "c2"]);
+
+        let resp = BatchContractStatsResponse {
+            stats: vec![ContractStats {
+                contract_id: "c1".to_string(),
+                invocation_count: 5,
+                last_invoked: None,
+                avg_gas_cost: 123.45,
+            }],
+        };
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        let resp_back: BatchContractStatsResponse = serde_json::from_str(&resp_json).unwrap();
+        assert_eq!(resp_back.stats.len(), 1);
+        assert_eq!(resp_back.stats[0].contract_id, "c1");
+        assert_eq!(resp_back.stats[0].invocation_count, 5);
     }
 }

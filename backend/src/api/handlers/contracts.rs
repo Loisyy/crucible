@@ -137,6 +137,13 @@ pub async fn analyze_dependencies(
         .await
         .map_err(AppError::Database)?;
 
+    if result.max_depth_exceeded {
+        return Err(AppError::ValidationError(format!(
+            "Dependency graph recursion exceeds maximum limit of {} layers",
+            crate::services::dependency_analyzer::MAX_DEPENDENCY_DEPTH
+        )));
+    }
+
     Ok(Json(ApiResponse::new(result)))
 }
 

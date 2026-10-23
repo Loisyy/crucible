@@ -166,6 +166,7 @@ fn test_database_to_pool_options() {
         idle_timeout_secs: 30,
         pool_retry_after_secs: 5,
         worker_max_connections: 10,
+        tcp_keepalive_secs: 60,
     };
 
     let _pool_opts = config.to_sqlx_pool_options();
@@ -183,6 +184,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             max_body_size: 10 * 1024 * 1024,
             compile_max_size: 1024 * 1024,
             sandbox_max_size: 5 * 1024 * 1024,
+            http2_max_concurrent_streams: 100,
             tls: Some(crate::config::server::TlsConfig {
                 cert_path: "/path/to/cert".into(),
                 key_path: "/path/to/secret.key".into(),
@@ -196,6 +198,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             idle_timeout_secs: 5,
             pool_retry_after_secs: 5,
             worker_max_connections: 10,
+            tcp_keepalive_secs: 60,
         },
         redis: crate::config::RedisConfig {
             url: "redis://:secretpass@host".into(),
@@ -203,6 +206,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             pool_size: 10,
             connection_timeout_ms: 1000,
             max_retries: 3,
+            startup_timeout_ms: 30000,
         },
         observability: crate::config::ObservabilityConfig {
             log_level: "info".into(),
@@ -271,6 +275,31 @@ fn test_production_rejects_empty_cors_origins() {
                     assert!(
                         errors.iter().any(|e| e.contains("CORS allowed_origins must not be empty")),
                         "Expected CORS empty error, got: {:?}",
+                        errors
+                    );
+                }
+                _ => panic!("Expected ValidationError, got {:?}", err),
+            }
+        },
+    );
+}
+
+#[test]
+fn test_cors_rejects_wildcard_with_credentials_in_development_and_staging() {
+    temp_env::with_vars(
+        [
+            ("APP_CORS__ALLOWED_ORIGINS__0", Some("*")),
+            ("APP_CORS__ALLOW_CREDENTIALS", Some("true")),
+        ],
+        || {
+            let err = AppConfig::load(Environment::Development)
+                .expect_err("Should fail with wildcard origin and allow_credentials=true in development");
+
+            match err {
+                crate::config::ConfigError::ValidationError(errors) => {
+                    assert!(
+                        errors.iter().any(|e| e.contains("AllowOrigin::any() / '*' is strictly prohibited")),
+                        "Expected CORS wildcard with credentials error, got: {:?}",
                         errors
                     );
                 }

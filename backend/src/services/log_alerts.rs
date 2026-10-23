@@ -24,11 +24,12 @@
 #![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
+use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -91,7 +92,7 @@ pub struct AlertRule {
     pub id: Uuid,
     /// Human-readable name.
     pub name: String,
-    /// Substring pattern to match against log messages.
+    /// Regex pattern to match against log messages.
     pub pattern: String,
     /// Severity assigned to alerts fired by this rule.
     pub severity: AlertSeverity,
@@ -102,7 +103,7 @@ pub struct AlertRule {
 }
 
 impl AlertRule {
-    /// Validate that the rule has sensible configuration values.
+    /// Validate that the rule has sensible configuration values and a valid regex pattern.
     pub fn validate(&self) -> Result<(), AlertError> {
         if self.name.trim().is_empty() {
             return Err(AlertError::InvalidRule("name must not be empty".to_string()));
@@ -119,6 +120,9 @@ impl AlertRule {
             return Err(AlertError::InvalidRule(
                 "window_secs must be > 0".to_string(),
             ));
+        }
+        if let Err(e) = regex::Regex::new(&self.pattern) {
+            return Err(AlertError::InvalidRule(format!("invalid regex pattern: {e}")));
         }
         Ok(())
     }
@@ -147,6 +151,37 @@ pub struct Alert {
 // Internal state
 // ---------------------------------------------------------------------------
 
+/// Pre-compiled regex set indexing rules for single-pass multi-pattern matching.
+#[derive(Default, Clone)]
+pub struct CompiledRuleSet {
+    regex_set: Option<RegexSet>,
+    rule_ids: Vec<Uuid>,
+}
+
+impl CompiledRuleSet {
+    fn compile(rules: &HashMap<Uuid, AlertRule>) -> Result<Self, AlertError> {
+        if rules.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut rule_ids = Vec::with_capacity(rules.len());
+        let mut patterns = Vec::with_capacity(rules.len());
+
+        for (id, rule) in rules {
+            rule_ids.push(*id);
+            patterns.push(rule.pattern.as_str());
+        }
+
+        let regex_set = RegexSet::new(&patterns)
+            .map_err(|e| AlertError::InvalidRule(format!("failed to compile regex set: {e}")))?;
+
+        Ok(Self {
+            regex_set: Some(regex_set),
+            rule_ids,
+        })
+    }
+}
+
 /// Tracks recent log-entry timestamps per rule for sliding-window evaluation.
 #[derive(Debug, Default)]
 struct RuleState {
@@ -167,38 +202,75 @@ impl RuleState {
 // ---------------------------------------------------------------------------
 
 /// Manages alert rules, evaluates incoming log entries, and stores fired alerts.
+#[derive(Clone)]
 pub struct AlertManager {
     rules: Arc<RwLock<HashMap<Uuid, AlertRule>>>,
+    compiled_rules: Arc<RwLock<CompiledRuleSet>>,
     alerts: Arc<RwLock<Vec<Alert>>>,
     rule_states: Arc<RwLock<HashMap<Uuid, RuleState>>>,
+    async_tx: mpsc::Sender<LogEntry>,
 }
 
 impl AlertManager {
-    /// Create a new `AlertManager` with no rules.
+    /// Default channel buffer capacity for asynchronous log alert evaluation.
+    pub const DEFAULT_CHANNEL_CAPACITY: usize = 10_000;
+
+    /// Create a new `AlertManager` with no rules and starts asynchronous background worker.
     pub fn new() -> Self {
-        Self {
-            rules: Arc::new(RwLock::new(HashMap::new())),
-            alerts: Arc::new(RwLock::new(Vec::new())),
-            rule_states: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::with_capacity(Self::DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Add or replace an alert rule.
+    /// Create a new `AlertManager` with custom asynchronous channel buffer capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<LogEntry>(capacity);
+        let rules = Arc::new(RwLock::new(HashMap::new()));
+        let compiled_rules = Arc::new(RwLock::new(CompiledRuleSet::default()));
+        let alerts = Arc::new(RwLock::new(Vec::new()));
+        let rule_states = Arc::new(RwLock::new(HashMap::new()));
+
+        let manager = Self {
+            rules: rules.clone(),
+            compiled_rules: compiled_rules.clone(),
+            alerts: alerts.clone(),
+            rule_states: rule_states.clone(),
+            async_tx: tx,
+        };
+
+        // Dedicated background worker task for asynchronous log stream processing
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some(entry) = rx.recv().await {
+                    Self::evaluate_internal(&rules, &compiled_rules, &rule_states, &alerts, &entry)
+                        .await;
+                }
+            });
+        }
+
+        manager
+    }
+
+    /// Add or replace an alert rule and atomically re-compile the RegexSet.
     pub async fn add_rule(&self, rule: AlertRule) -> Result<(), AlertError> {
         rule.validate()?;
         let id = rule.id;
         info!(rule_id = %id, rule_name = %rule.name, "Adding alert rule");
-        self.rules.write().await.insert(id, rule);
+
+        let mut rules = self.rules.write().await;
+        rules.insert(id, rule);
+        let compiled = CompiledRuleSet::compile(&rules)?;
+        *self.compiled_rules.write().await = compiled;
         self.rule_states.write().await.entry(id).or_default();
         Ok(())
     }
 
-    /// Remove an alert rule by ID.
+    /// Remove an alert rule by ID and atomically update the pre-compiled RegexSet.
     pub async fn remove_rule(&self, rule_id: Uuid) -> Result<(), AlertError> {
-        let removed = self.rules.write().await.remove(&rule_id).is_some();
-        if !removed {
+        let mut rules = self.rules.write().await;
+        if rules.remove(&rule_id).is_none() {
             return Err(AlertError::RuleNotFound(rule_id));
         }
+        let compiled = CompiledRuleSet::compile(&rules)?;
+        *self.compiled_rules.write().await = compiled;
         self.rule_states.write().await.remove(&rule_id);
         info!(rule_id = %rule_id, "Removed alert rule");
         Ok(())
@@ -209,31 +281,78 @@ impl AlertManager {
         self.rules.read().await.values().cloned().collect()
     }
 
-    /// Evaluate a [`LogEntry`] against all active rules.
+    /// Evaluate a [`LogEntry`] against all active rules using the pre-compiled [`RegexSet`].
     pub async fn evaluate(&self, entry: &LogEntry) {
-        let rules = self.rules.read().await;
-        let mut states = self.rule_states.write().await;
+        Self::evaluate_internal(
+            &self.rules,
+            &self.compiled_rules,
+            &self.rule_states,
+            &self.alerts,
+            entry,
+        )
+        .await;
+    }
+
+    /// Asynchronously submit a [`LogEntry`] to be evaluated on dedicated background worker tasks.
+    pub async fn evaluate_async(&self, entry: LogEntry) -> Result<(), AlertError> {
+        self.async_tx
+            .send(entry)
+            .await
+            .map_err(|e| AlertError::Internal(format!("failed to enqueue log entry: {e}")))
+    }
+
+    /// Try to asynchronously submit a [`LogEntry`] without awaiting if buffer has space.
+    pub fn try_evaluate_async(&self, entry: LogEntry) -> Result<(), AlertError> {
+        self.async_tx
+            .try_send(entry)
+            .map_err(|e| AlertError::Internal(format!("failed to enqueue log entry: {e}")))
+    }
+
+    /// Internal evaluation logic using single-pass regex set matching.
+    async fn evaluate_internal(
+        rules_lock: &Arc<RwLock<HashMap<Uuid, AlertRule>>>,
+        compiled_lock: &Arc<RwLock<CompiledRuleSet>>,
+        states_lock: &Arc<RwLock<HashMap<Uuid, RuleState>>>,
+        alerts_lock: &Arc<RwLock<Vec<Alert>>>,
+        entry: &LogEntry,
+    ) {
+        let compiled = compiled_lock.read().await.clone();
+        let (regex_set, rule_ids) = match (&compiled.regex_set, &compiled.rule_ids) {
+            (Some(set), ids) if !ids.is_empty() => (set, ids),
+            _ => return,
+        };
+
+        // Single-pass regex evaluation across all rules simultaneously
+        let matches = regex_set.matches(&entry.message);
+        if !matches.matched_any() {
+            return;
+        }
+
+        let rules = rules_lock.read().await;
+        let mut states = states_lock.write().await;
         let mut fired: Vec<Alert> = Vec::new();
 
-        for (id, rule) in rules.iter() {
-            if !entry.message.contains(&rule.pattern) {
-                continue;
-            }
+        for match_idx in matches.into_iter() {
+            let rule_id = rule_ids[match_idx];
+            let rule = match rules.get(&rule_id) {
+                Some(r) => r,
+                None => continue,
+            };
 
             debug!(
-                rule_id = %id,
+                rule_id = %rule_id,
                 rule_name = %rule.name,
                 message = %entry.message,
-                "Log entry matched rule pattern"
+                "Log entry matched rule pattern via pre-compiled regex set"
             );
 
-            let state = states.entry(*id).or_default();
+            let state = states.entry(rule_id).or_default();
             state.hits.push(entry.timestamp);
             let count = state.prune_and_count(rule.window_secs);
 
             if count >= rule.threshold {
                 warn!(
-                    rule_id = %id,
+                    rule_id = %rule_id,
                     rule_name = %rule.name,
                     count = count,
                     threshold = rule.threshold,
@@ -242,7 +361,7 @@ impl AlertManager {
                 );
                 fired.push(Alert {
                     id: Uuid::new_v4(),
-                    rule_id: *id,
+                    rule_id,
                     rule_name: rule.name.clone(),
                     severity: rule.severity.clone(),
                     match_count: count,
@@ -257,7 +376,7 @@ impl AlertManager {
         drop(states);
 
         if !fired.is_empty() {
-            let mut alerts = self.alerts.write().await;
+            let mut alerts = alerts_lock.write().await;
             for alert in fired {
                 error!(
                     alert_id = %alert.id,
@@ -360,6 +479,12 @@ mod tests {
     }
 
     #[test]
+    fn test_rule_validation_invalid_regex_pattern() {
+        let rule = make_rule("[invalid", 3, 60);
+        assert!(matches!(rule.validate(), Err(AlertError::InvalidRule(_))));
+    }
+
+    #[test]
     fn test_rule_validation_zero_threshold() {
         let rule = make_rule("ERROR", 0, 60);
         assert!(matches!(rule.validate(), Err(AlertError::InvalidRule(_))));
@@ -424,6 +549,35 @@ mod tests {
         let alerts = manager.get_alerts(None).await;
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].match_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_regex_pattern_matching() {
+        let manager = AlertManager::new();
+        // Regex pattern with wildcards and word boundary
+        let rule = make_rule(r"timeout:\s+\d+ms", 2, 60);
+        manager.add_rule(rule).await.unwrap();
+        manager.evaluate(&make_entry("Database timeout: 500ms")).await;
+        manager.evaluate(&make_entry("Cache timeout: 120ms")).await;
+        let alerts = manager.get_alerts(None).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].match_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_async_evaluate_channel() {
+        let manager = AlertManager::new();
+        manager.add_rule(make_rule("ASYNC_ERR", 2, 60)).await.unwrap();
+        
+        manager.evaluate_async(make_entry("ASYNC_ERR 1")).await.unwrap();
+        manager.evaluate_async(make_entry("ASYNC_ERR 2")).await.unwrap();
+
+        // Give background worker time to drain queue
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let alerts = manager.get_alerts(None).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].match_count, 2);
     }
 
     #[tokio::test]

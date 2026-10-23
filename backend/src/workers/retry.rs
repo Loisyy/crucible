@@ -139,10 +139,43 @@ pub struct DlqEntry {
     pub retry_count: u32,
 }
 
+/// Configuration for randomized jitter during bulk DLQ replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DlqJitterConfig {
+    /// Minimum jitter delay in milliseconds.
+    pub min_delay_ms: u64,
+    /// Maximum jitter delay in milliseconds.
+    pub max_delay_ms: u64,
+}
+
+impl Default for DlqJitterConfig {
+    fn default() -> Self {
+        Self {
+            min_delay_ms: 10,
+            max_delay_ms: 150,
+        }
+    }
+}
+
+impl DlqJitterConfig {
+    pub fn zero() -> Self {
+        Self {
+            min_delay_ms: 0,
+            max_delay_ms: 0,
+        }
+    }
+}
+
 /// Replay request payload accepted by the DLQ endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DlqReplayRequest {
     pub job_ids: Vec<String>,
+    /// Optional minimum jitter delay in milliseconds between bulk replays.
+    #[serde(default)]
+    pub min_delay_ms: Option<u64>,
+    /// Optional maximum jitter delay in milliseconds between bulk replays.
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
 }
 
 /// Response payload for the DLQ replay request.
@@ -150,6 +183,37 @@ pub struct DlqReplayRequest {
 pub struct DlqReplayResponse {
     pub replayed: Vec<String>,
     pub failed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_jitter_ms: Vec<u64>,
+}
+
+/// Computes a randomized jitter delay within `[min_delay, max_delay]`.
+///
+/// Uses pseudo-entropy derived from high-resolution system clock nanoseconds
+/// mixed with a sequence index, avoiding synchronization across concurrent replays
+/// without requiring external PRNG crates.
+pub fn compute_jitter_delay(min_delay: Duration, max_delay: Duration, seq: usize) -> Duration {
+    if max_delay <= min_delay || max_delay.is_zero() {
+        return min_delay;
+    }
+
+    let min_ms = min_delay.as_millis() as u64;
+    let max_ms = max_delay.as_millis() as u64;
+    let range = max_ms.saturating_sub(min_ms);
+
+    if range == 0 {
+        return min_delay;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+
+    let mixed = nanos.wrapping_add((seq as u64).wrapping_mul(6_364_136_223_846_793_005));
+    let jitter_ms = min_ms + (mixed % (range + 1));
+
+    Duration::from_millis(jitter_ms)
 }
 
 /// Redis-backed dead-letter queue coordinator for transient job replay.
@@ -203,6 +267,16 @@ impl DlqCoordinator {
         &self,
         job_ids: Vec<String>,
     ) -> Result<DlqReplayResponse, redis::RedisError> {
+        self.replay_with_jitter(job_ids, None).await
+    }
+
+    /// Bulk-replays dead-letter jobs with randomized jitter between replayed items
+    /// to eliminate synchronized thundering herd spikes against downstream systems.
+    pub async fn replay_with_jitter(
+        &self,
+        job_ids: Vec<String>,
+        jitter: Option<DlqJitterConfig>,
+    ) -> Result<DlqReplayResponse, redis::RedisError> {
         let mut conn = self.redis.get_multiplexed_async_connection().await?;
         let hash_key = format!("{}:map", self.queue_key);
 
@@ -214,8 +288,24 @@ impl DlqCoordinator {
 
         let mut replayed = Vec::new();
         let mut failed = Vec::new();
+        let mut applied_jitter_ms = Vec::new();
 
-        for job_id in ids {
+        let jitter_cfg = jitter.unwrap_or_default();
+        let min_delay = Duration::from_millis(jitter_cfg.min_delay_ms);
+        let max_delay = Duration::from_millis(jitter_cfg.max_delay_ms);
+
+        for (idx, job_id) in ids.into_iter().enumerate() {
+            // Apply randomized jitter delay on subsequent items in bulk replays
+            if idx > 0 && max_delay > Duration::ZERO {
+                let jitter_delay = compute_jitter_delay(min_delay, max_delay, idx);
+                applied_jitter_ms.push(jitter_delay.as_millis() as u64);
+                if !jitter_delay.is_zero() {
+                    tokio::time::sleep(jitter_delay).await;
+                }
+            } else {
+                applied_jitter_ms.push(0);
+            }
+
             // Distributed lock idempotency guard per job_id
             let lock_key = format!("{}:lock:{}", self.queue_key, job_id);
             let set_lock: bool = redis::cmd("SET")
@@ -246,7 +336,11 @@ impl DlqCoordinator {
             replayed.push(job_id);
         }
 
-        Ok(DlqReplayResponse { replayed, failed })
+        Ok(DlqReplayResponse {
+            replayed,
+            failed,
+            applied_jitter_ms,
+        })
     }
 }
 
@@ -255,7 +349,23 @@ pub async fn handle_dlq_replay(
     State(store): State<Arc<DlqCoordinator>>,
     Json(request): Json<DlqReplayRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<DlqReplayResponse>)> {
-    match store.replay(request.job_ids).await {
+    let jitter = match (request.min_delay_ms, request.max_delay_ms) {
+        (Some(min_ms), Some(max_ms)) => Some(DlqJitterConfig {
+            min_delay_ms: min_ms,
+            max_delay_ms: max_ms,
+        }),
+        (Some(min_ms), None) => Some(DlqJitterConfig {
+            min_delay_ms: min_ms,
+            max_delay_ms: min_ms.max(150),
+        }),
+        (None, Some(max_ms)) => Some(DlqJitterConfig {
+            min_delay_ms: 0,
+            max_delay_ms: max_ms,
+        }),
+        (None, None) => Some(DlqJitterConfig::default()),
+    };
+
+    match store.replay_with_jitter(request.job_ids, jitter).await {
         Ok(resp) => Ok((StatusCode::OK, Json(resp))),
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -897,5 +1007,108 @@ mod tests {
     async fn free_retry_succeeds() {
         let result = retry(|| async { Ok::<_, String>("free") }).await;
         assert_eq!(result.unwrap(), "free");
+    }
+
+    // ---- DLQ replay jitter tests -------------------------------------------
+
+    #[test]
+    fn test_compute_jitter_delay_within_bounds() {
+        let min = Duration::from_millis(15);
+        let max = Duration::from_millis(120);
+        for seq in 0..100 {
+            let delay = compute_jitter_delay(min, max, seq);
+            assert!(
+                delay >= min,
+                "delay {:?} should be >= min {:?}",
+                delay,
+                min
+            );
+            assert!(
+                delay <= max,
+                "delay {:?} should be <= max {:?}",
+                delay,
+                max
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_jitter_delay_zero_and_fixed() {
+        assert_eq!(
+            compute_jitter_delay(Duration::ZERO, Duration::ZERO, 0),
+            Duration::ZERO
+        );
+        let fixed = Duration::from_millis(42);
+        assert_eq!(compute_jitter_delay(fixed, fixed, 1), fixed);
+    }
+
+    #[test]
+    fn test_compute_jitter_delay_distribution_variance() {
+        let min = Duration::from_millis(10);
+        let max = Duration::from_millis(500);
+        let mut delays = std::collections::HashSet::new();
+        for seq in 0..50 {
+            let delay = compute_jitter_delay(min, max, seq);
+            delays.insert(delay.as_millis());
+        }
+        assert!(
+            delays.len() > 1,
+            "Randomized jitter should generate varying delays across batch items"
+        );
+    }
+
+    #[test]
+    fn test_dlq_replay_request_deserialization() {
+        let json = r#"{"job_ids":["job-1","job-2"],"min_delay_ms":20,"max_delay_ms":200}"#;
+        let req: DlqReplayRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.job_ids, vec!["job-1", "job-2"]);
+        assert_eq!(req.min_delay_ms, Some(20));
+        assert_eq!(req.max_delay_ms, Some(200));
+
+        let json_default = r#"{"job_ids":["job-1"]}"#;
+        let req_default: DlqReplayRequest = serde_json::from_str(json_default).unwrap();
+        assert_eq!(req_default.job_ids, vec!["job-1"]);
+        assert_eq!(req_default.min_delay_ms, None);
+        assert_eq!(req_default.max_delay_ms, None);
+    }
+
+    #[test]
+    fn test_dlq_replay_response_serialization() {
+        let resp = DlqReplayResponse {
+            replayed: vec!["job-1".to_string(), "job-2".to_string()],
+            failed: vec![],
+            applied_jitter_ms: vec![0, 45],
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(serialized.contains("replayed"));
+        assert!(serialized.contains("applied_jitter_ms"));
+
+        let deserialized: DlqReplayResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, resp);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_replay_jitter_timing() {
+        let count = 4;
+        let min = Duration::from_millis(5);
+        let max = Duration::from_millis(15);
+        let start = std::time::Instant::now();
+
+        let mut applied = Vec::new();
+        for idx in 0..count {
+            if idx > 0 {
+                let delay = compute_jitter_delay(min, max, idx);
+                applied.push(delay.as_millis() as u64);
+                tokio::time::sleep(delay).await;
+            } else {
+                applied.push(0);
+            }
+        }
+
+        let elapsed = start.elapsed();
+        assert_eq!(applied.len(), 4);
+        assert_eq!(applied[0], 0); // First job fires immediately
+        assert!(applied[1] >= 5 && applied[1] <= 15);
+        assert!(elapsed >= Duration::from_millis(15));
     }
 }

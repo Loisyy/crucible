@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 static SECRET_KEY_REGEX: OnceLock<Regex> = OnceLock::new();
+static SENSITIVE_CREDENTIALS_REGEX: OnceLock<Regex> = OnceLock::new();
 
 /// Structured log entry conforming to Elastic Common Schema (ECS) with PII sanitization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -15,10 +16,33 @@ pub struct StructuredLog {
     pub context: serde_json::Value,
 }
 
-/// Scrubs 56-character Stellar secret keys (`S...`) from log messages to prevent secret key leakage.
+/// Redacts sensitive query parameters (e.g. `token=`, `secret=`, `api_key=`, `password=`) from a query string.
+pub fn sanitize_query_string(query: &str) -> String {
+    let re = SENSITIVE_CREDENTIALS_REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(token|secret|api_key|apikey|password|auth|access_token)=([^& \t\r\n\x22]*)").unwrap()
+    });
+    re.replace_all(query, "$1=[REDACTED]").to_string()
+}
+
+/// Formats a URI path and its query string, redacting any sensitive parameters before logging.
+pub fn sanitize_uri_for_log(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    if let Some(query) = uri.query() {
+        let sanitized_query = sanitize_query_string(query);
+        format!("{}?{}", path, sanitized_query)
+    } else {
+        path.to_string()
+    }
+}
+
+/// Scrubs 56-character Stellar secret keys (`S...`) and sensitive query parameters from log messages.
 pub fn sanitize_log_message(msg: &str) -> String {
-    let re = SECRET_KEY_REGEX.get_or_init(|| Regex::new(r"S[A-Z2-7]{55}").unwrap());
-    re.replace_all(msg, "[REDACTED_SECRET_KEY]").to_string()
+    let sec_re = SECRET_KEY_REGEX.get_or_init(|| Regex::new(r"S[A-Z2-7]{55}").unwrap());
+    let scrubbed = sec_re.replace_all(msg, "[REDACTED_SECRET_KEY]");
+    let cred_re = SENSITIVE_CREDENTIALS_REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(token|secret|api_key|apikey|password|auth|access_token)=([^& \t\r\n\x22]*)").unwrap()
+    });
+    cred_re.replace_all(&scrubbed, "$1=[REDACTED]").to_string()
 }
 
 /// Formats a log message into structured JSON conforming to ECS with PII sanitization.
@@ -89,13 +113,14 @@ pub async fn logging_middleware(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let version = request.version();
-    let metric_route = request
+    let raw_route = request
         .extensions()
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
-        .unwrap_or("UNMATCHED")
-        .to_string();
+        .unwrap_or_else(|| uri.path());
+    let metric_route = crate::services::http_metrics::normalize_route(raw_route);
 
+    let request_target = sanitize_for_log(&sanitize_uri_for_log(&uri));
     let path = sanitize_for_log(uri.path());
     let span = TracingService::http_request_span(method.as_str(), &path, None);
     TracingService::extract_and_attach_trace_context(request.headers(), &span);
@@ -103,7 +128,7 @@ pub async fn logging_middleware(
     let value = span.clone();
     async move {
         // Log the incoming request
-        tracing::debug!("Incoming request");
+        tracing::debug!(target = %request_target, "Incoming request");
 
         let response = next.run(request).await;
 
@@ -120,15 +145,16 @@ pub async fn logging_middleware(
         tracing::info!(
             latency_ms = latency.as_millis(),
             status = status.as_u16(),
+            target = %request_target,
             ?version,
             "Finished processing request"
         );
 
-        // Format structured log message with secret key sanitization
+        // Format structured log message with secret key & credential sanitization
         let raw_log = format!(
             "{} {} finished with {} in {:?}",
             sanitize_for_log(method.as_str()),
-            path,
+            request_target,
             status,
             latency
         );
@@ -275,5 +301,35 @@ mod tests {
         assert_eq!(parsed.trace_id, "trace-123");
         assert_eq!(parsed.message, "User login success");
         assert_eq!(parsed.context["user_id"], 42);
+    }
+
+    #[test]
+    fn test_sensitive_credentials_query_sanitization() {
+        let raw_query = "token=secret123&page=1&api_key=mykey456&secret=topsecret&filter=active";
+        let sanitized = sanitize_query_string(raw_query);
+        assert_eq!(
+            sanitized,
+            "token=[REDACTED]&page=1&api_key=[REDACTED]&secret=[REDACTED]&filter=active"
+        );
+        assert!(!sanitized.contains("secret123"));
+        assert!(!sanitized.contains("mykey456"));
+        assert!(!sanitized.contains("topsecret"));
+    }
+
+    #[test]
+    fn test_sanitize_uri_for_log() {
+        let uri: axum::http::Uri = "/api/v1/resource?token=sec123&sort=asc".parse().unwrap();
+        let sanitized = sanitize_uri_for_log(&uri);
+        assert_eq!(sanitized, "/api/v1/resource?token=[REDACTED]&sort=asc");
+    }
+
+    #[test]
+    fn test_sanitize_log_message_redacts_credentials_and_stellar_keys() {
+        let raw_log = "GET /api/v1?token=token_xyz with key SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBB";
+        let sanitized = sanitize_log_message(raw_log);
+        assert!(sanitized.contains("token=[REDACTED]"));
+        assert!(sanitized.contains("[REDACTED_SECRET_KEY]"));
+        assert!(!sanitized.contains("token_xyz"));
+        assert!(!sanitized.contains("SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBB"));
     }
 }

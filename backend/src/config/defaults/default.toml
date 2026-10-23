@@ -3,11 +3,12 @@ host = "0.0.0.0"
 port = 8080
 request_timeout_ms = 30000
 max_connections = 1000
+http2_max_concurrent_streams = 100
 
 [database]
 max_connections = 10
 min_connections = 1
-connect_timeout_secs = 10
+connect_timeout_secs = 3
 idle_timeout_secs = 600
 pool_retry_after_secs = 5
 
@@ -15,6 +16,7 @@ pool_retry_after_secs = 5
 pool_size = 10
 connection_timeout_ms = 5000
 max_retries = 3
+startup_timeout_ms = 30000
 
 [cors]
 allowed_origins = ["*"]

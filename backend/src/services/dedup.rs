@@ -33,10 +33,30 @@ pub struct DedupConfig {
     pub namespace: String,
     /// Completed duplicate response TTL in seconds.
     pub result_ttl_seconds: usize,
-    /// In-flight lock TTL in seconds.
+    /// In-flight lock TTL in seconds (default base lock TTL).
     pub lock_ttl_seconds: usize,
+    /// Additional lock TTL in seconds per crate dependency.
+    pub ttl_per_dependency_seconds: usize,
+    /// Maximum in-flight lock TTL in seconds.
+    pub max_lock_ttl_seconds: usize,
+    /// Default heartbeat renewal interval in seconds.
+    pub heartbeat_interval_seconds: u64,
+    /// Lock extension duration in seconds on heartbeat renewal.
+    pub heartbeat_extension_seconds: usize,
     /// Redis list used to enqueue accepted build requests.
     pub queue_name: String,
+}
+
+impl DedupConfig {
+    /// Computes dynamic lock TTL proportional to contract crate dependencies.
+    ///
+    /// TTL = clamp(lock_ttl_seconds + (dependency_count * ttl_per_dependency_seconds), lock_ttl_seconds, max_lock_ttl_seconds)
+    pub fn compute_lock_ttl(&self, crate_dependency_count: usize) -> usize {
+        let additional = crate_dependency_count.saturating_mul(self.ttl_per_dependency_seconds);
+        let dynamic_ttl = self.lock_ttl_seconds.saturating_add(additional);
+        let max_ttl = self.max_lock_ttl_seconds.max(self.lock_ttl_seconds);
+        dynamic_ttl.clamp(self.lock_ttl_seconds, max_ttl)
+    }
 }
 
 impl Default for DedupConfig {
@@ -45,6 +65,10 @@ impl Default for DedupConfig {
             namespace: DEFAULT_NAMESPACE.to_string(),
             result_ttl_seconds: 86_400,
             lock_ttl_seconds: 900,
+            ttl_per_dependency_seconds: 5,
+            max_lock_ttl_seconds: 3_600,
+            heartbeat_interval_seconds: 10,
+            heartbeat_extension_seconds: 30,
             queue_name: "build:requests".to_string(),
         }
     }
@@ -90,6 +114,32 @@ impl BuildRequest {
     pub fn idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
         self.idempotency_key = Some(idempotency_key.into());
         self
+    }
+
+    /// Extracts or computes crate dependency count from the request body if present.
+    /// Inspects `dependency_count` (integer), `dependencies` (array or object count),
+    /// or `crate_dependencies` (array or integer).
+    pub fn crate_dependency_count(&self) -> usize {
+        if let Some(count) = self.body.get("dependency_count").and_then(|v| v.as_u64()) {
+            return count as usize;
+        }
+        if let Some(deps) = self.body.get("dependencies") {
+            if let Some(arr) = deps.as_array() {
+                return arr.len();
+            }
+            if let Some(obj) = deps.as_object() {
+                return obj.len();
+            }
+        }
+        if let Some(deps) = self.body.get("crate_dependencies") {
+            if let Some(arr) = deps.as_array() {
+                return arr.len();
+            }
+            if let Some(count) = deps.as_u64() {
+                return count as usize;
+            }
+        }
+        0
     }
 
     fn validate(&self) -> Result<(), DedupError> {
@@ -283,10 +333,26 @@ impl BuildDedupService {
     /// Time complexity is O(n) for JSON serialization plus O(1) Redis and
     /// indexed PostgreSQL operations. Space complexity is O(n), where n is the
     /// serialized request size.
+    /// Checks and registers a build request using dependency-proportional lock TTL.
+    ///
+    /// Time complexity is O(n) for JSON serialization plus O(1) Redis and
+    /// indexed PostgreSQL operations. Space complexity is O(n), where n is the
+    /// serialized request size.
     #[instrument(skip(self, request), fields(path = %request.path, method = %request.method))]
     pub async fn check_or_register(
         &self,
         request: BuildRequest,
+    ) -> Result<DedupDecision, DedupError> {
+        let lock_ttl = self.config.compute_lock_ttl(request.crate_dependency_count());
+        self.check_or_register_with_ttl(request, lock_ttl).await
+    }
+
+    /// Checks and registers a build request with an explicit lock TTL.
+    #[instrument(skip(self, request), fields(path = %request.path, method = %request.method))]
+    pub async fn check_or_register_with_ttl(
+        &self,
+        request: BuildRequest,
+        lock_ttl_seconds: usize,
     ) -> Result<DedupDecision, DedupError> {
         let fingerprint = Self::fingerprint(&request)?;
         let request_id = Uuid::new_v4();
@@ -313,7 +379,7 @@ impl BuildDedupService {
             .arg(request_id.to_string())
             .arg("NX")
             .arg("EX")
-            .arg(self.config.lock_ttl_seconds)
+            .arg(lock_ttl_seconds)
             .query_async(&mut conn)
             .await?;
 
@@ -344,6 +410,95 @@ impl BuildDedupService {
         info!(%fingerprint, %request_id, "accepted unique build request");
 
         Ok(DedupDecision::accepted(fingerprint, request_id))
+    }
+
+    /// Extends the in-flight deduplication lock TTL in Redis if held by the specified request_id.
+    ///
+    /// Uses an atomic Lua script to verify lock ownership before calling EXPIRE.
+    /// Returns Ok(true) if the lock was renewed, Ok(false) if the lock was lost or expired.
+    #[instrument(skip(self))]
+    pub async fn extend_lock(
+        &self,
+        fingerprint: &str,
+        request_id: Uuid,
+        extension_secs: usize,
+    ) -> Result<bool, DedupError> {
+        let lock_key = self.lock_key(fingerprint);
+        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let result: i32 = redis::Script::new(
+            r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("EXPIRE", KEYS[1], ARGV[2])
+            end
+            return 0
+            "#,
+        )
+        .key(lock_key)
+        .arg(request_id.to_string())
+        .arg(extension_secs)
+        .invoke_async(&mut conn)
+        .await?;
+
+        Ok(result == 1)
+    }
+
+    /// Starts a background heartbeat renewal task that periodically extends the deduplication lock.
+    /// Returns a `DedupHeartbeatGuard` which cancels the heartbeat when dropped or explicitly stopped.
+    pub fn start_heartbeat(
+        self: &Arc<Self>,
+        fingerprint: impl Into<String>,
+        request_id: Uuid,
+    ) -> DedupHeartbeatGuard {
+        let interval = std::time::Duration::from_secs(self.config.heartbeat_interval_seconds);
+        let extension = self.config.heartbeat_extension_seconds;
+        self.start_heartbeat_with_params(fingerprint, request_id, interval, extension)
+    }
+
+    /// Starts a background heartbeat renewal task with custom interval and extension durations.
+    pub fn start_heartbeat_with_params(
+        self: &Arc<Self>,
+        fingerprint: impl Into<String>,
+        request_id: Uuid,
+        interval: std::time::Duration,
+        extension_secs: usize,
+    ) -> DedupHeartbeatGuard {
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let service = Arc::clone(self);
+        let fp = fingerprint.into();
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        match service.extend_lock(&fp, request_id, extension_secs).await {
+                            Ok(true) => {
+                                debug!(fingerprint = %fp, %request_id, "extended dedup lock heartbeat");
+                            }
+                            Ok(false) => {
+                                warn!(fingerprint = %fp, %request_id, "failed to extend dedup lock heartbeat: lock lost or expired");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(fingerprint = %fp, %request_id, error = %e, "error extending dedup lock heartbeat");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        DedupHeartbeatGuard {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
     }
 
     /// Marks a request completed and stores the replay id in Redis.
@@ -460,6 +615,37 @@ impl BuildDedupService {
         .invoke_async::<i32>(&mut conn)
         .await?;
         Ok(())
+    }
+}
+
+/// RAII guard that manages an active deduplication lock heartbeat renewal task.
+///
+/// When dropped or stopped, the background renewal task terminates.
+pub struct DedupHeartbeatGuard {
+    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DedupHeartbeatGuard {
+    /// Manually stops the heartbeat renewal task.
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// Checks whether the heartbeat is currently active.
+    pub fn is_active(&self) -> bool {
+        self.handle.as_ref().map_or(false, |h| !h.is_finished())
+    }
+}
+
+impl Drop for DedupHeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -586,7 +772,69 @@ mod tests {
     }
 
     #[test]
-    fn handler_router_can_be_constructed() {
+    fn compute_lock_ttl_proportional_to_dependencies() {
+        let config = DedupConfig {
+            lock_ttl_seconds: 30,
+            ttl_per_dependency_seconds: 5,
+            max_lock_ttl_seconds: 120,
+            ..DedupConfig::default()
+        };
+
+        // 0 dependencies -> base TTL 30s
+        assert_eq!(config.compute_lock_ttl(0), 30);
+        // 5 dependencies -> 30 + 5*5 = 55s
+        assert_eq!(config.compute_lock_ttl(5), 55);
+        // 10 dependencies -> 30 + 10*5 = 80s
+        assert_eq!(config.compute_lock_ttl(10), 80);
+        // 100 dependencies -> capped at max 120s
+        assert_eq!(config.compute_lock_ttl(100), 120);
+    }
+
+    #[test]
+    fn crate_dependency_count_extraction() {
+        let req_empty = BuildRequest::new("POST", "/build", json!({}));
+        assert_eq!(req_empty.crate_dependency_count(), 0);
+
+        let req_array = BuildRequest::new("POST", "/build", json!({
+            "dependencies": ["syn", "quote", "proc-macro2", "serde"]
+        }));
+        assert_eq!(req_array.crate_dependency_count(), 4);
+
+        let req_obj = BuildRequest::new("POST", "/build", json!({
+            "dependencies": { "syn": "2.0", "serde": "1.0" }
+        }));
+        assert_eq!(req_obj.crate_dependency_count(), 2);
+
+        let req_num = BuildRequest::new("POST", "/build", json!({
+            "dependency_count": 15
+        }));
+        assert_eq!(req_num.crate_dependency_count(), 15);
+
+        let req_crate_deps = BuildRequest::new("POST", "/build", json!({
+            "crate_dependencies": ["dep1", "dep2", "dep3"]
+        }));
+        assert_eq!(req_crate_deps.crate_dependency_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_guard_lifecycle() {
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let mut guard = DedupHeartbeatGuard {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        };
+
+        assert!(guard.is_active());
+        guard.stop();
+        assert!(!guard.is_active());
+    }
+
+    #[tokio::test]
+    async fn handler_router_can_be_constructed() {
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@localhost/crucible_test")
             .unwrap();
@@ -618,6 +866,7 @@ mod tests {
             result_ttl_seconds: 60,
             lock_ttl_seconds: 30,
             queue_name: format!("build:requests:test:{}", Uuid::new_v4()),
+            ..DedupConfig::default()
         };
         let service = BuildDedupService::with_config(db, redis, config);
         let request = sample_request().idempotency_key("ci-build-1");
@@ -650,6 +899,7 @@ mod tests {
             result_ttl_seconds: 60,
             lock_ttl_seconds: 30,
             queue_name: format!("build:requests:test:{}", Uuid::new_v4()),
+            ..DedupConfig::default()
         };
         let service = BuildDedupService::with_config(db, redis, config);
         let request = sample_request().idempotency_key("ci-build-2");

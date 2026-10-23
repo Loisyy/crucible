@@ -9,20 +9,13 @@ use redis::Client as RedisClient;
 use sqlx::PgPool;
 
 use crate::api::handlers::{
-    coverage::CoverageState,
-    dashboard::DashboardState,
-    profiling::AppState,
-    ws::WsState,
+    coverage::CoverageState, dashboard::DashboardState, profiling::AppState, ws::WsState,
 };
 use crate::config::reload::ConfigManager;
 use crate::services::{
-    audit::AuditService,
-    contract_benchmark::ContractBenchmarkService,
-    error_recovery::ErrorManager,
-    log_aggregator::LogAggregator,
-    log_alerts::AlertManager,
-    sys_metrics::MetricsExporter,
-    test_coverage::TestCoverageService,
+    audit::AuditService, contract_benchmark::ContractBenchmarkService,
+    error_recovery::ErrorManager, log_aggregator::LogAggregator, log_alerts::AlertManager,
+    sys_metrics::MetricsExporter, test_coverage::TestCoverageService,
 };
 
 /// Shared service handles used when building route state.
@@ -75,6 +68,14 @@ pub fn build_application_states(
     let websocket = Arc::new(WsState {
         metrics_exporter: services.metrics_exporter.clone(),
         error_manager: services.error_manager.clone(),
+        outbound_buffer_limit: crate::api::handlers::ws::DEFAULT_MAX_OUTBOUND_BUFFER,
+        send_timeout: crate::api::handlers::ws::DEFAULT_SEND_TIMEOUT,
+        auth_state: Some(Arc::new(
+            crate::api::middleware::auth::AdminAuthState::from_env(),
+        )),
+        jwt_secret: std::env::var("JWT_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
     });
 
     let audit = Arc::new(AuditService::new(db_pool, Arc::new(redis_client)));
@@ -117,11 +118,7 @@ mod tests {
     #[test]
     fn application_states_construction_succeeds() {
         let services = test_services();
-        let states = build_application_states(
-            test_db_pool(),
-            test_redis_client(),
-            &services,
-        );
+        let states = build_application_states(test_db_pool(), test_redis_client(), &services);
 
         assert!(Arc::strong_count(&states.profiling) >= 1);
         assert!(Arc::strong_count(&states.dashboard) >= 1);
@@ -134,11 +131,7 @@ mod tests {
     #[test]
     fn profiling_and_websocket_share_metrics_exporter() {
         let services = test_services();
-        let states = build_application_states(
-            test_db_pool(),
-            test_redis_client(),
-            &services,
-        );
+        let states = build_application_states(test_db_pool(), test_redis_client(), &services);
 
         assert!(Arc::ptr_eq(
             &states.profiling.metrics_exporter,

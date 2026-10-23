@@ -171,6 +171,11 @@ impl AppConfig {
             errors.push("Redis pool_size must be greater than 0.".to_string());
         }
 
+        // Validate CORS configuration invariants across all environments (Issue #1246)
+        if let Err(cors_err) = self.cors.validate() {
+            errors.push(cors_err);
+        }
+
         if env == Environment::Production || env == Environment::Staging {
             if self.cors.allowed_origins.is_empty() {
                 errors.push(

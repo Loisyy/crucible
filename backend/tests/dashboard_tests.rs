@@ -1,11 +1,12 @@
 use axum::{
     body::Body,
     http::{Request, StatusCode},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use backend::api::handlers::dashboard::{
-    get_contract_stats, get_dashboard_metrics, DashboardState,
+    get_batch_contract_stats, get_batch_contract_stats_query, get_contract_stats,
+    get_dashboard_metrics, DashboardState,
 };
 use backend::services::{
     error_recovery::ErrorManager, log_alerts::AlertManager, sys_metrics::MetricsExporter,
@@ -335,6 +336,100 @@ async fn test_redis_caching() {
         .unwrap();
 
     assert_eq!(response2.status(), StatusCode::OK);
+
+    cleanup_test_data(&pool).await;
+}
+
+#[tokio::test]
+async fn test_get_batch_contract_stats_success() {
+    let pool = setup_test_db().await;
+    let redis = setup_test_redis().await;
+    cleanup_test_data(&pool).await;
+
+    // Insert test data for multiple contracts
+    sqlx::query("INSERT INTO contracts (contract_id) VALUES ('batch_c1'), ('batch_c2')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO transactions (contract_id, status, processing_time_ms, gas_cost) 
+         VALUES ('batch_c1', 'success', 100.0, 1200.0),
+                ('batch_c1', 'success', 150.0, 1400.0),
+                ('batch_c2', 'failed', 200.0, 2000.0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = Arc::new(DashboardState {
+        metrics_exporter: Arc::new(MetricsExporter::new()),
+        error_manager: Arc::new(ErrorManager::new()),
+        alert_manager: Arc::new(AlertManager::new()),
+        db: pool.clone(),
+        redis: redis.clone(),
+    });
+
+    let app = Router::new()
+        .route(
+            "/contracts/stats/batch",
+            post(get_batch_contract_stats),
+        )
+        .route(
+            "/contracts/stats",
+            get(get_batch_contract_stats_query),
+        )
+        .with_state(state);
+
+    // Test POST batch
+    let payload = serde_json::json!({
+        "contract_ids": ["batch_c1", "batch_c2", "nonexistent"]
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/contracts/stats/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let stats = res["stats"].as_array().unwrap();
+    assert_eq!(stats.len(), 2);
+    assert_eq!(stats[0]["contract_id"], "batch_c1");
+    assert_eq!(stats[0]["invocation_count"], 2);
+    assert_eq!(stats[1]["contract_id"], "batch_c2");
+    assert_eq!(stats[1]["invocation_count"], 1);
+
+    // Test GET query string
+    let response_query = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/contracts/stats?contract_ids=batch_c1,batch_c2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response_query.status(), StatusCode::OK);
+    let body_query = axum::body::to_bytes(response_query.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let res_query: serde_json::Value = serde_json::from_slice(&body_query).unwrap();
+    let stats_query = res_query["stats"].as_array().unwrap();
+    assert_eq!(stats_query.len(), 2);
 
     cleanup_test_data(&pool).await;
 }

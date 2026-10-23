@@ -27,6 +27,79 @@ pub enum Role {
     Guest,
 }
 
+/// Granular permission bitmask for high-performance permission checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PermissionBitmask(pub u32);
+
+impl PermissionBitmask {
+    pub const NONE: Self = Self(0);
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    pub const DELETE: Self = Self(1 << 3);
+    pub const ADMIN: Self = Self(1 << 4);
+    pub const AUDIT: Self = Self(1 << 5);
+    pub const ALL: Self = Self(0xFFFFFFFF);
+
+    #[inline]
+    pub const fn contains(&self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    #[inline]
+    pub const fn has_any(&self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    #[inline]
+    pub fn add(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    #[inline]
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+}
+
+impl Default for PermissionBitmask {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl std::ops::BitOr for PermissionBitmask {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for PermissionBitmask {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl Role {
+    /// Return the default permission bitmask associated with this role.
+    pub fn default_permissions(&self) -> PermissionBitmask {
+        match self {
+            Role::Admin => PermissionBitmask::ALL,
+            Role::Developer => {
+                PermissionBitmask::READ
+                    | PermissionBitmask::WRITE
+                    | PermissionBitmask::EXECUTE
+            }
+            Role::Auditor => PermissionBitmask::READ | PermissionBitmask::AUDIT,
+            Role::Viewer => PermissionBitmask::READ,
+            Role::User => PermissionBitmask::READ | PermissionBitmask::EXECUTE,
+            Role::Guest => PermissionBitmask::READ,
+        }
+    }
+}
+
 /// Organization model for multi-tenant enterprise isolation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Organization {
@@ -76,11 +149,215 @@ pub struct PermissionState {
 }
 
 /// Extension type to store authenticated user information in request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthUser {
     pub id: i32,
     pub address: String,
     pub role: Role,
+    pub organization_id: Option<i32>,
+    pub permissions: Option<PermissionBitmask>,
+}
+
+impl AuthUser {
+    /// Create a new authenticated user with default role permissions.
+    pub fn new(id: i32, address: impl Into<String>, role: Role) -> Self {
+        Self {
+            id,
+            address: address.into(),
+            role,
+            organization_id: None,
+            permissions: Some(role.default_permissions()),
+        }
+    }
+
+    /// Associate an organization / tenant ID with this user.
+    pub fn with_org(mut self, organization_id: i32) -> Self {
+        self.organization_id = Some(organization_id);
+        self
+    }
+
+    /// Configure specific permission bitmask overrides.
+    pub fn with_permissions(mut self, permissions: PermissionBitmask) -> Self {
+        self.permissions = Some(permissions);
+        self
+    }
+
+    /// Return effective permission bitmask (explicit permissions or fallback to role defaults).
+    pub fn effective_permissions(&self) -> PermissionBitmask {
+        self.permissions.unwrap_or_else(|| self.role.default_permissions())
+    }
+
+    /// Check if user belongs to the designated organization.
+    pub fn belongs_to_org(&self, org_id: i32) -> bool {
+        self.organization_id == Some(org_id)
+    }
+}
+
+/// Detailed error returned when a permission or tenant isolation check fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionCheckError {
+    Unauthenticated,
+    InsufficientPermissions {
+        required: PermissionBitmask,
+        actual: PermissionBitmask,
+    },
+    TenantIsolationViolation {
+        user_org: Option<i32>,
+        target_org: i32,
+    },
+}
+
+impl std::fmt::Display for PermissionCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthenticated => write!(f, "Authentication required"),
+            Self::InsufficientPermissions { required, actual } => {
+                write!(
+                    f,
+                    "Insufficient permissions: required bitmask {:#x}, actual bitmask {:#x}",
+                    required.0, actual.0
+                )
+            }
+            Self::TenantIsolationViolation { user_org, target_org } => {
+                write!(
+                    f,
+                    "Cross-tenant access forbidden: user organization {:?} cannot access organization {}",
+                    user_org, target_org
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PermissionCheckError {}
+
+/// Map an action string to its canonical permission bitmask flag.
+pub fn action_to_bitmask(action: &str) -> PermissionBitmask {
+    match action.to_ascii_lowercase().as_str() {
+        "read" | "get" | "list" | "view" | "describe" => PermissionBitmask::READ,
+        "write" | "post" | "put" | "patch" | "create" | "update" => PermissionBitmask::WRITE,
+        "delete" | "destroy" | "remove" => PermissionBitmask::DELETE,
+        "execute" | "run" | "invoke" | "deploy" => PermissionBitmask::EXECUTE,
+        "admin" | "manage" | "grant" | "revoke" => PermissionBitmask::ADMIN,
+        "audit" | "compliance" | "log" => PermissionBitmask::AUDIT,
+        _ => PermissionBitmask::READ,
+    }
+}
+
+/// Extract target organization / tenant ID from request URI or headers.
+///
+/// Supports:
+/// - Header `X-Organization-ID` or `X-Tenant-ID`
+/// - Path segments `/organizations/{id}/`, `/orgs/{id}/`, `/tenants/{id}/`, `/workspaces/{id}/`
+/// - Query string `?org_id={id}`, `?organization_id={id}`, `?tenant_id={id}`
+pub fn extract_target_tenant_id(
+    uri: &str,
+    headers: Option<&axum::http::HeaderMap>,
+) -> Option<i32> {
+    // 1. Inspect HTTP headers for tenant context
+    if let Some(headers) = headers {
+        if let Some(val) = headers
+            .get("x-organization-id")
+            .or_else(|| headers.get("x-tenant-id"))
+        {
+            if let Ok(s) = val.to_str() {
+                if let Ok(id) = s.trim().parse::<i32>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+
+    // 2. Parse URI path segments
+    let path = uri.split('?').next().unwrap_or(uri);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, segment) in segments.iter().enumerate() {
+        let seg_lower = segment.to_ascii_lowercase();
+        if (seg_lower == "organizations"
+            || seg_lower == "orgs"
+            || seg_lower == "tenants"
+            || seg_lower == "org")
+            && i + 1 < segments.len()
+        {
+            if let Ok(id) = segments[i + 1].parse::<i32>() {
+                return Some(id);
+            }
+        }
+    }
+
+    // 3. Parse query string parameters
+    if let Some(query) = uri.split('?').nth(1) {
+        for pair in query.split('&') {
+            let mut parts = pair.split('=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                let k_lower = k.to_ascii_lowercase();
+                if k_lower == "org_id" || k_lower == "organization_id" || k_lower == "tenant_id" {
+                    if let Ok(id) = v.parse::<i32>() {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Cross-references authenticated user permissions against required bitmask and enforces tenant isolation.
+///
+/// Ensures:
+/// 1. The user possesses the required permission bitmask for the operation (Admins bypass bitmask check).
+/// 2. If the resource URI or request headers designate a target organization/tenant ID,
+///    non-admin users are strictly restricted to accessing resources belonging to their own `organization_id`.
+pub fn check_permission(
+    user: &AuthUser,
+    required_bitmask: PermissionBitmask,
+    resource_uri: &str,
+    headers: Option<&axum::http::HeaderMap>,
+) -> Result<(), PermissionCheckError> {
+    // 1. Bitmask verification
+    let user_perms = user.effective_permissions();
+    if user.role != Role::Admin && !user_perms.contains(required_bitmask) {
+        warn!(
+            user_id = user.id,
+            role = ?user.role,
+            required = required_bitmask.0,
+            actual = user_perms.0,
+            "Insufficient permission bitmask"
+        );
+        return Err(PermissionCheckError::InsufficientPermissions {
+            required: required_bitmask,
+            actual: user_perms,
+        });
+    }
+
+    // 2. Tenant isolation verification against target organization/tenant ID in resource URI / headers
+    if let Some(target_org_id) = extract_target_tenant_id(resource_uri, headers) {
+        // Role::Admin possesses cross-tenant authority across all organizations.
+        // All other roles must strictly match their registered organization_id.
+        if user.role != Role::Admin {
+            match user.organization_id {
+                Some(user_org) if user_org == target_org_id => {
+                    // Valid tenant match
+                }
+                user_org => {
+                    warn!(
+                        user_id = user.id,
+                        user_org = ?user_org,
+                        target_org = target_org_id,
+                        resource_uri = resource_uri,
+                        "Tenant isolation bypass blocked: cross-tenant access denied"
+                    );
+                    return Err(PermissionCheckError::TenantIsolationViolation {
+                        user_org,
+                        target_org: target_org_id,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Permission checker service with caching.
@@ -249,6 +526,29 @@ pub fn require_permission(
                 }
             };
 
+            // Enforce tenant ownership validation alongside permission bitmask checks
+            let required_bitmask = action_to_bitmask(&permission.action);
+            let resource_uri = request
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_else(|| request.uri().path());
+
+            if let Err(check_err) = check_permission(&user, required_bitmask, resource_uri, Some(request.headers())) {
+                warn!(
+                    user_id = user.id,
+                    error = %check_err,
+                    resource = %permission.resource,
+                    action = %permission.action,
+                    "Access denied by check_permission"
+                );
+                return crate::api::errors::make_error_response(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    &check_err.to_string(),
+                );
+            }
+
             let checker = PermissionChecker::new(state.db.clone(), state.redis.clone());
 
             match checker.has_permission(user.id, &permission).await {
@@ -375,15 +675,61 @@ mod tests {
     }
 
     #[test]
+    fn test_permission_bitmask_operations() {
+        let mut mask = PermissionBitmask::READ | PermissionBitmask::WRITE;
+        assert!(mask.contains(PermissionBitmask::READ));
+        assert!(mask.contains(PermissionBitmask::WRITE));
+        assert!(!mask.contains(PermissionBitmask::EXECUTE));
+        assert!(!mask.contains(PermissionBitmask::ADMIN));
+
+        mask.add(PermissionBitmask::EXECUTE);
+        assert!(mask.contains(PermissionBitmask::EXECUTE));
+
+        mask.remove(PermissionBitmask::WRITE);
+        assert!(!mask.contains(PermissionBitmask::WRITE));
+        assert!(mask.contains(PermissionBitmask::READ));
+        assert!(mask.contains(PermissionBitmask::EXECUTE));
+    }
+
+    #[test]
+    fn test_role_default_bitmask_permissions() {
+        assert!(Role::Admin.default_permissions().contains(PermissionBitmask::ALL));
+        assert!(Role::Developer.default_permissions().contains(PermissionBitmask::READ | PermissionBitmask::WRITE));
+        assert!(!Role::Viewer.default_permissions().contains(PermissionBitmask::WRITE));
+        assert!(Role::Auditor.default_permissions().contains(PermissionBitmask::AUDIT));
+    }
+
+    #[test]
+    fn test_extract_target_tenant_id() {
+        // Path segment
+        assert_eq!(extract_target_tenant_id("/api/v1/organizations/42/contracts", None), Some(42));
+        assert_eq!(extract_target_tenant_id("/api/v1/orgs/101/workspaces", None), Some(101));
+        assert_eq!(extract_target_tenant_id("/tenants/77/dashboard", None), Some(77));
+        assert_eq!(extract_target_tenant_id("/contracts/analyze", None), None);
+
+        // Query param
+        assert_eq!(extract_target_tenant_id("/api/v1/contracts?org_id=55", None), Some(55));
+        assert_eq!(extract_target_tenant_id("/api/v1/contracts?tenant_id=88", None), Some(88));
+
+        // Header
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-organization-id", "99".parse().unwrap());
+        assert_eq!(extract_target_tenant_id("/api/v1/contracts", Some(&headers)), Some(99));
+    }
+
+    #[test]
     fn test_auth_user_clone() {
         let user = AuthUser {
             id: 1,
             address: "test@example.com".to_string(),
             role: Role::Developer,
+            organization_id: Some(10),
+            permissions: Some(Role::Developer.default_permissions()),
         };
         let cloned = user.clone();
         assert_eq!(user.id, cloned.id);
         assert_eq!(user.role, cloned.role);
+        assert_eq!(user.organization_id, cloned.organization_id);
     }
 
     #[tokio::test]
@@ -392,12 +738,115 @@ mod tests {
             id: 101,
             address: "dev_org_a@crucible.io".to_string(),
             role: Role::Developer,
+            organization_id: Some(1),
+            permissions: Some(Role::Developer.default_permissions()),
         };
-        let target_workspace_org_b_id = 999;
+        let target_workspace_org_b_uri = "/api/v1/organizations/999/workspaces/42";
 
         // User from Org A attempting access to Org B workspace should be denied
-        assert_ne!(user_org_a.id, target_workspace_org_b_id);
-        assert_eq!(user_org_a.role, Role::Developer);
+        let denial = check_permission(
+            &user_org_a,
+            PermissionBitmask::READ,
+            target_workspace_org_b_uri,
+            None,
+        );
+        assert_eq!(
+            denial,
+            Err(PermissionCheckError::TenantIsolationViolation {
+                user_org: Some(1),
+                target_org: 999,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_organization_permission_success() {
+        let user_org_a = AuthUser {
+            id: 101,
+            address: "dev_org_a@crucible.io".to_string(),
+            role: Role::Developer,
+            organization_id: Some(1),
+            permissions: Some(Role::Developer.default_permissions()),
+        };
+        let target_uri_org_a = "/api/v1/organizations/1/workspaces/42";
+
+        let allowed = check_permission(
+            &user_org_a,
+            PermissionBitmask::READ,
+            target_uri_org_a,
+            None,
+        );
+        assert!(allowed.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_admin_cross_tenant_bypass() {
+        let admin = AuthUser::new(1, "admin@crucible.io", Role::Admin).with_org(1);
+        let target_uri_org_b = "/api/v1/organizations/999/workspaces/42";
+
+        // Admin has superuser authority across all tenants
+        let admin_access = check_permission(
+            &admin,
+            PermissionBitmask::ALL,
+            target_uri_org_b,
+            None,
+        );
+        assert!(admin_access.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_insufficient_bitmask_permission_denial() {
+        let viewer = AuthUser::new(2, "viewer@crucible.io", Role::Viewer).with_org(1);
+        let uri = "/api/v1/organizations/1/contracts/deploy";
+
+        // Viewer lacks WRITE/EXECUTE permissions
+        let result = check_permission(
+            &viewer,
+            PermissionBitmask::WRITE,
+            uri,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(PermissionCheckError::InsufficientPermissions { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_unscoped_resource_permission_success() {
+        let developer = AuthUser::new(3, "dev@crucible.io", Role::Developer);
+        let uri = "/api/v1/health";
+
+        // Unscoped global resource should succeed for authorized role
+        let result = check_permission(
+            &developer,
+            PermissionBitmask::READ,
+            uri,
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_header_based_tenant_isolation() {
+        let user = AuthUser::new(10, "user@crucible.io", Role::User).with_org(5);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-organization-id", "9".parse().unwrap());
+
+        // Header claims org 9 while user belongs to org 5 -> reject
+        let result = check_permission(
+            &user,
+            PermissionBitmask::READ,
+            "/api/v1/resource",
+            Some(&headers),
+        );
+        assert_eq!(
+            result,
+            Err(PermissionCheckError::TenantIsolationViolation {
+                user_org: Some(5),
+                target_org: 9,
+            })
+        );
     }
 }
 

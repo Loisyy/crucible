@@ -28,6 +28,9 @@ fn fixture_ui_tests() {
     t.compile_fail("tests/ui/fail-fixture-args-multiple.rs");
     t.compile_fail("tests/ui/fail-missing-setup.rs");
     t.compile_fail("tests/ui/fail-invalid-generics.rs");
+    t.compile_fail("tests/ui/fail-fixture-duplicate-dep.rs");
+    t.compile_fail("tests/ui/fail-fixture-self-dep.rs");
+    t.compile_fail("tests/ui/fail-fixture-malformed-requires.rs");
 
     // --- fixture dependency graph fail cases ---
     t.compile_fail("tests/ui/fail-fixture-self-cycle.rs");

@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::services::contract_call_logger::ContractCallLogger;
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -26,6 +27,270 @@ pub struct SystemStatsResponse {
     pub total_contract_calls: i64,
     pub system_uptime_secs: u64,
     pub maintenance_mode: bool,
+}
+
+/// User role hierarchy ranks for calculating elevation vs demotion.
+pub fn role_rank(role: &str) -> u32 {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "admin" => 100,
+        "moderator" => 90,
+        "developer" => 80,
+        "auditor" => 60,
+        "viewer" => 40,
+        "user" => 20,
+        "guest" => 10,
+        _ => 0,
+    }
+}
+
+/// Validates whether a provided role name is a recognized system role.
+pub fn is_valid_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "admin" | "moderator" | "developer" | "auditor" | "viewer" | "user" | "guest"
+    )
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateUserRoleRequest {
+    /// Target role (e.g., "admin", "developer", "auditor", "viewer", "user", "guest").
+    pub role: String,
+    /// Actor performing the elevation/modification (optional; extracted from header/caller context if omitted).
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    /// Optional justification or reason for role change.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElevateRoleRequest {
+    /// Target user ID (optional if address is provided).
+    #[serde(default)]
+    pub target_user_id: Option<i32>,
+    /// Target user ID alias.
+    #[serde(default)]
+    pub user_id: Option<i32>,
+    /// Target user address (optional if user_id is provided).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Target role to elevate to.
+    pub role: String,
+    /// Actor ID performing elevation.
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    /// Reason or ticket ID.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleElevationRecord {
+    pub user_id: i32,
+    pub address: String,
+    pub previous_role: String,
+    pub new_role: String,
+    pub is_elevation: bool,
+    pub actor_id: String,
+    pub audit_log_id: i64,
+    pub audit_hash: String,
+    pub previous_hash: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleElevationAuditLogItem {
+    pub id: i64,
+    pub event_type: String,
+    pub actor_id: Option<String>,
+    pub target_user_id: Option<i32>,
+    pub previous_role: Option<String>,
+    pub new_role: Option<String>,
+    pub is_elevation: Option<bool>,
+    pub reason: Option<String>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub hash: String,
+    pub previous_hash: String,
+}
+
+/// Resolves actor ID from headers or request payload.
+pub fn resolve_actor_id(headers: &axum::http::HeaderMap, payload_actor: Option<&str>) -> String {
+    if let Some(actor) = payload_actor {
+        if !actor.trim().is_empty() {
+            return actor.trim().to_string();
+        }
+    }
+    if let Some(header_val) = headers.get("X-Actor-Id").or_else(|| headers.get("x-actor-id")) {
+        if let Ok(val) = header_val.to_str() {
+            if !val.trim().is_empty() {
+                return val.trim().to_string();
+            }
+        }
+    }
+    if let Some(header_val) = headers.get("X-User-Id").or_else(|| headers.get("x-user-id")) {
+        if let Ok(val) = header_val.to_str() {
+            if !val.trim().is_empty() {
+                return val.trim().to_string();
+            }
+        }
+    }
+    "admin".to_string()
+}
+
+/// Atomically executes role modification / elevation in a single PostgreSQL database transaction.
+/// Synchronously inserts an immutable SHA-256 hash-chained audit record into `audit_logs`.
+pub async fn execute_role_elevation_tx(
+    pool: &sqlx::PgPool,
+    redis_client: Option<&redis::Client>,
+    actor_id: &str,
+    target_user_id: i32,
+    target_role: &str,
+    reason: Option<&str>,
+) -> Result<RoleElevationRecord, AppError> {
+    let normalized_role = target_role.trim().to_lowercase();
+    if !is_valid_role(&normalized_role) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid role '{}'. Allowed roles: admin, moderator, developer, auditor, viewer, user, guest",
+            target_role
+        )));
+    }
+
+    // Begin database transaction
+    let mut tx = pool.begin().await.map_err(AppError::Database)?;
+
+    // 1. Fetch target user and current role with row-level lock FOR UPDATE
+    let user_row: Option<(i32, String, String)> = sqlx::query_as(
+        r#"
+        SELECT id, address, role::text
+        FROM users
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(target_user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
+
+    let (uid, address, previous_role) = match user_row {
+        Some(row) => row,
+        None => {
+            return Err(AppError::NotFound(format!(
+                "User with id {} not found",
+                target_user_id
+            )));
+        }
+    };
+
+    let prev_norm = previous_role.trim().to_lowercase();
+    let is_elevation = role_rank(&normalized_role) > role_rank(&prev_norm);
+    let event_type = if is_elevation {
+        "role_elevation"
+    } else if role_rank(&normalized_role) < role_rank(&prev_norm) {
+        "role_demotion"
+    } else {
+        "role_update"
+    };
+
+    // 2. Perform role update in users table
+    let enum_update = sqlx::query("UPDATE users SET role = $1::user_role WHERE id = $2")
+        .bind(&normalized_role)
+        .bind(uid)
+        .execute(&mut *tx)
+        .await;
+
+    if enum_update.is_err() {
+        sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
+            .bind(&normalized_role)
+            .bind(uid)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+    }
+
+    // 3. Retrieve latest audit log entry's hash for immutable SHA-256 hash chaining
+    let prev_hash_row: Option<(String,)> = sqlx::query_as(
+        "SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .ok()
+    .flatten();
+
+    let previous_hash = prev_hash_row.map(|r| r.0).unwrap_or_default();
+    let now = chrono::Utc::now();
+
+    let details = serde_json::json!({
+        "actor_id": actor_id,
+        "target_user_id": uid,
+        "target_user_address": address,
+        "previous_role": prev_norm,
+        "new_role": normalized_role,
+        "is_elevation": is_elevation,
+        "reason": reason,
+        "timestamp": now.to_rfc3339()
+    });
+
+    // 4. Compute cryptographic SHA-256 chain hash
+    let canonical = format!(
+        "{}:{}:{}:{}:{}",
+        previous_hash,
+        event_type,
+        actor_id,
+        serde_json::to_string(&details).unwrap_or_default(),
+        now.to_rfc3339()
+    );
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, canonical.as_bytes());
+    let audit_hash = format!("{:x}", sha2::Digest::finalize(hasher));
+
+    // 5. Synchronously insert immutable audit log record in same transaction
+    let audit_log_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO audit_logs (event_type, user_id, details, timestamp, hash, previous_hash)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id::bigint
+        "#,
+    )
+    .bind(event_type)
+    .bind(actor_id)
+    .bind(&details)
+    .bind(now)
+    .bind(&audit_hash)
+    .bind(&previous_hash)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Commit transaction atomically
+    tx.commit().await.map_err(AppError::Database)?;
+
+    // 6. Post-commit cache invalidation and chain tip update in Redis
+    if let Some(redis) = redis_client {
+        if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+            use redis::AsyncCommands;
+            let role_key = format!("role:{}", uid);
+            let _: Result<(), _> = conn.del(&role_key).await;
+            let _: Result<(), _> = conn.set("audit:last_hash", &audit_hash).await;
+        }
+    }
+
+    Ok(RoleElevationRecord {
+        user_id: uid,
+        address,
+        previous_role: prev_norm,
+        new_role: normalized_role,
+        is_elevation,
+        actor_id: actor_id.to_string(),
+        audit_log_id,
+        audit_hash,
+        previous_hash,
+        timestamp: now,
+    })
 }
 
 /// GET /api/v1/admin/system-stats
@@ -86,6 +351,173 @@ pub async fn get_admin_logs(
     Ok(Json(ApiResponse::new(logs)))
 }
 
+/// PUT or POST /api/v1/admin/users/:user_id/role
+///
+/// Modifies a user's role and synchronously records an immutable audit log entry in the same transaction.
+pub async fn update_user_role(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(target_user_id): axum::extract::Path<i32>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<UpdateUserRoleRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database connection not configured".to_string()))?;
+
+    let actor_id = resolve_actor_id(&headers, payload.actor_id.as_deref());
+
+    let record = execute_role_elevation_tx(
+        pool,
+        Some(&state.redis),
+        &actor_id,
+        target_user_id,
+        &payload.role,
+        payload.reason.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(ApiResponse::new(record)))
+}
+
+/// GET /api/v1/admin/users/:user_id/role
+pub async fn get_user_role(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(target_user_id): axum::extract::Path<i32>,
+) -> Result<impl IntoResponse, AppError> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database connection not configured".to_string()))?;
+
+    let row: Option<(i32, String, String)> = sqlx::query_as(
+        "SELECT id, address, role::text FROM users WHERE id = $1",
+    )
+    .bind(target_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let (id, address, role) = row.ok_or_else(|| {
+        AppError::NotFound(format!("User with id {} not found", target_user_id))
+    })?;
+
+    Ok(Json(ApiResponse::new(serde_json::json!({
+        "userId": id,
+        "address": address,
+        "role": role
+    }))))
+}
+
+/// POST /api/v1/admin/roles/elevate
+///
+/// Dedicated endpoint to elevate a target user's role with mandatory immutable audit logging.
+pub async fn elevate_user_role(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<ElevateRoleRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database connection not configured".to_string()))?;
+
+    let actor_id = resolve_actor_id(&headers, payload.actor_id.as_deref());
+
+    let target_id = if let Some(id) = payload.target_user_id.or(payload.user_id) {
+        id
+    } else if let Some(ref addr) = payload.address {
+        let user_id: i32 = sqlx::query_scalar("SELECT id FROM users WHERE address = $1")
+            .bind(addr)
+            .fetch_optional(pool)
+            .await
+            .map_err(AppError::Database)?
+            .ok_or_else(|| AppError::NotFound(format!("User with address '{}' not found", addr)))?;
+        user_id
+    } else {
+        return Err(AppError::BadRequest(
+            "targetUserId, userId, or address must be provided".to_string(),
+        ));
+    };
+
+    let record = execute_role_elevation_tx(
+        pool,
+        Some(&state.redis),
+        &actor_id,
+        target_id,
+        &payload.role,
+        payload.reason.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(ApiResponse::new(record)))
+}
+
+/// GET /api/v1/admin/audit/role-elevations
+///
+/// Fetches recent role elevation and modification audit log records from the immutable `audit_logs` table.
+pub async fn get_role_elevation_audit_logs(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database connection not configured".to_string()))?;
+
+    let rows: Vec<(i64, String, Option<String>, serde_json::Value, chrono::DateTime<chrono::Utc>, String, String)> =
+        sqlx::query_as(
+            r#"
+            SELECT id, event_type, user_id, details, timestamp, hash, previous_hash
+            FROM audit_logs
+            WHERE event_type IN ('role_elevation', 'role_demotion', 'role_update', 'user.role_elevation', 'user.role_update')
+            ORDER BY id DESC
+            LIMIT 100
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    let items: Vec<RoleElevationAuditLogItem> = rows
+        .into_iter()
+        .map(|(id, event_type, user_id, details, timestamp, hash, previous_hash)| {
+            let target_user_id = details
+                .get("target_user_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let previous_role = details
+                .get("previous_role")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let new_role = details
+                .get("new_role")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let is_elevation = details.get("is_elevation").and_then(|v| v.as_bool());
+            let reason = details
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+
+            RoleElevationAuditLogItem {
+                id,
+                event_type,
+                actor_id: user_id,
+                target_user_id,
+                previous_role,
+                new_role,
+                is_elevation,
+                reason,
+                timestamp,
+                hash,
+                previous_hash,
+            }
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::new(items)))
+}
+
 /// GET /api/v1/admin/config
 ///
 /// Returns the current effective configuration with all sensitive fields redacted.
@@ -102,4 +534,92 @@ pub async fn get_effective_config(
     let config = config_manager.load();
     let sanitized = sanitize::sanitize(&config);
     Ok(Json(ApiResponse::new(sanitized)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_role_hierarchy_ranks() {
+        assert!(role_rank("admin") > role_rank("developer"));
+        assert!(role_rank("developer") > role_rank("auditor"));
+        assert!(role_rank("auditor") > role_rank("viewer"));
+        assert!(role_rank("viewer") > role_rank("user"));
+        assert!(role_rank("user") > role_rank("guest"));
+        assert_eq!(role_rank("unknown"), 0);
+    }
+
+    #[test]
+    fn test_is_valid_role() {
+        assert!(is_valid_role("admin"));
+        assert!(is_valid_role("developer"));
+        assert!(is_valid_role("auditor"));
+        assert!(is_valid_role("viewer"));
+        assert!(is_valid_role("user"));
+        assert!(is_valid_role("guest"));
+        assert!(is_valid_role("moderator"));
+        assert!(!is_valid_role("super_root_god"));
+        assert!(!is_valid_role("hacker"));
+    }
+
+    #[test]
+    fn test_resolve_actor_id() {
+        let mut headers = axum::http::HeaderMap::new();
+        // 1. Explicit payload actor
+        assert_eq!(resolve_actor_id(&headers, Some("actor-123")), "actor-123");
+
+        // 2. Header X-Actor-Id
+        headers.insert("X-Actor-Id", "actor-header".parse().unwrap());
+        assert_eq!(resolve_actor_id(&headers, None), "actor-header");
+
+        // 3. Fallback when empty
+        let empty_headers = axum::http::HeaderMap::new();
+        assert_eq!(resolve_actor_id(&empty_headers, None), "admin");
+    }
+
+    #[test]
+    fn test_audit_hash_chain_tamper_detection() {
+        let prev_hash = "genesis_hash_0000000000";
+        let event_type = "role_elevation";
+        let actor = "admin_super";
+        let details = serde_json::json!({
+            "target_user_id": 42,
+            "previous_role": "user",
+            "new_role": "admin"
+        });
+        let ts = "2026-10-22T19:00:00Z";
+
+        let canonical1 = format!(
+            "{}:{}:{}:{}:{}",
+            prev_hash, event_type, actor, details, ts
+        );
+        let mut hasher1 = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher1, canonical1.as_bytes());
+        let hash1 = format!("{:x}", sha2::Digest::finalize(hasher1));
+
+        // Tamper with new_role
+        let tampered_details = serde_json::json!({
+            "target_user_id": 42,
+            "previous_role": "user",
+            "new_role": "guest"
+        });
+        let canonical2 = format!(
+            "{}:{}:{}:{}:{}",
+            prev_hash, event_type, actor, tampered_details, ts
+        );
+        let mut hasher2 = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher2, canonical2.as_bytes());
+        let hash2 = format!("{:x}", sha2::Digest::finalize(hasher2));
+
+        assert_ne!(hash1, hash2, "Tampering with details must alter computed SHA-256 hash");
+    }
+
+    #[test]
+    fn test_elevation_flag_detection() {
+        assert!(role_rank("admin") > role_rank("user"));
+        assert!(role_rank("developer") > role_rank("guest"));
+        assert!(!(role_rank("user") > role_rank("admin")));
+        assert!(!(role_rank("admin") > role_rank("admin")));
+    }
 }

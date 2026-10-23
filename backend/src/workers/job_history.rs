@@ -175,18 +175,94 @@ pub async fn get_recent_runs(
     Ok(runs)
 }
 
-/// Cleans up job run records older than the specified retention period.
-/// Returns the number of deleted records.
-pub async fn cleanup_old_runs(pool: &PgPool, retain_days: i64) -> Result<u64, JobError> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM job_runs
-        WHERE started_at < NOW() - INTERVAL '1 day' * $1
-        "#,
-    )
-    .bind(retain_days as f64)
-    .execute(pool)
-    .await?;
+/// Default batch size for pruning expired job runs (1,000 records).
+pub const DEFAULT_PRUNE_BATCH_SIZE: i64 = 1_000;
+/// Default pause between deletion batches in milliseconds (50ms) to release locks.
+pub const DEFAULT_PRUNE_BATCH_SLEEP_MS: u64 = 50;
 
-    Ok(result.rows_affected())
+/// Cleans up job run records older than the specified retention period using bounded batches
+/// to prevent exclusive table locks and starvation of active job insertions.
+/// Returns the total number of deleted records.
+pub async fn cleanup_old_runs(pool: &PgPool, retain_days: i64) -> Result<u64, JobError> {
+    cleanup_old_runs_batched(
+        pool,
+        retain_days,
+        DEFAULT_PRUNE_BATCH_SIZE,
+        std::time::Duration::from_millis(DEFAULT_PRUNE_BATCH_SLEEP_MS),
+    )
+    .await
 }
+
+/// Cleans up job run records older than the retention period in custom-sized batches
+/// with an optional pause between batches.
+pub async fn cleanup_old_runs_batched(
+    pool: &PgPool,
+    retain_days: i64,
+    batch_size: i64,
+    batch_pause: std::time::Duration,
+) -> Result<u64, JobError> {
+    let mut total_deleted: u64 = 0;
+    let batch_size = if batch_size <= 0 {
+        DEFAULT_PRUNE_BATCH_SIZE
+    } else {
+        batch_size
+    };
+
+    loop {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM job_runs
+            WHERE id IN (
+                SELECT id FROM job_runs
+                WHERE started_at < NOW() - INTERVAL '1 day' * $1
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(retain_days as f64)
+        .bind(batch_size)
+        .execute(pool)
+        .await?;
+
+        let rows_affected = result.rows_affected();
+        total_deleted += rows_affected;
+
+        // If fewer rows were deleted than the batch limit, all expired records have been pruned
+        if (rows_affected as i64) < batch_size {
+            break;
+        }
+
+        // Pause briefly between batches to yield table locks to concurrent job run insertions/updates
+        if !batch_pause.is_zero() {
+            tokio::time::sleep(batch_pause).await;
+        }
+    }
+
+    Ok(total_deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_job_run_status_roundtrip() {
+        assert_eq!(JobRunStatus::Running.as_str(), "running");
+        assert_eq!(JobRunStatus::Succeeded.as_str(), "succeeded");
+        assert_eq!(JobRunStatus::Failed.as_str(), "failed");
+        assert_eq!(JobRunStatus::TimedOut.as_str(), "timed_out");
+
+        assert_eq!(JobRunStatus::from_str("running"), JobRunStatus::Running);
+        assert_eq!(JobRunStatus::from_str("succeeded"), JobRunStatus::Succeeded);
+        assert_eq!(JobRunStatus::from_str("failed"), JobRunStatus::Failed);
+        assert_eq!(JobRunStatus::from_str("unknown"), JobRunStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_batch_constants() {
+        assert_eq!(DEFAULT_PRUNE_BATCH_SIZE, 1_000);
+        assert!(DEFAULT_PRUNE_BATCH_SIZE > 0 && DEFAULT_PRUNE_BATCH_SIZE <= 5_000);
+        assert_eq!(DEFAULT_PRUNE_BATCH_SLEEP_MS, 50);
+    }
+}
+

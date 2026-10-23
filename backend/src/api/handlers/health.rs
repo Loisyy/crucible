@@ -363,12 +363,19 @@ async fn check_database(pool: &PgPool) -> CheckResult {
 
 async fn check_cache(conn: &ConnectionManager) -> CheckResult {
     let mut conn = conn.clone();
-    match redis::cmd("PING").query_async::<String>(&mut conn).await {
-        Ok(_) => {
+    match crate::db::redis::check_redis_readiness(&mut conn, false).await {
+        Ok(report) if report.is_healthy => {
             debug!("Redis health check passed");
             CheckResult {
                 status: "up",
                 message: None,
+            }
+        }
+        Ok(report) => {
+            warn!("Redis health check degraded: {:?}", report.details);
+            CheckResult {
+                status: "down",
+                message: report.details.or_else(|| Some("node in loading or read-only state".into())),
             }
         }
         Err(e) => {
@@ -384,11 +391,15 @@ async fn check_cache(conn: &ConnectionManager) -> CheckResult {
 async fn check_queue(conn: &ConnectionManager) -> CheckResult {
     let mut conn = conn.clone();
 
-    let ping = redis::cmd("PING")
-        .query_async::<String>(&mut conn)
-        .await;
-    match ping {
-        Ok(_) => debug!("Queue backend connection is healthy"),
+    match crate::db::redis::check_redis_readiness(&mut conn, true).await {
+        Ok(report) if report.is_healthy => debug!("Queue backend connection is healthy"),
+        Ok(report) => {
+            warn!("Queue backend connection degraded: {:?}", report.details);
+            return CheckResult {
+                status: "down",
+                message: report.details.or_else(|| Some("queue backend read-only or loading".into())),
+            };
+        }
         Err(e) => {
             warn!("Queue backend connection failed: {e}");
             return CheckResult {

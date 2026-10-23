@@ -7,6 +7,7 @@ pub struct MetricsService {
     pub volume: Counter,
     pub pool_exhaustion: Counter,
     pub worker_job_dropped: Counter,
+    pub dropped_logs: Counter,
 }
 
 static POOL_EXHAUSTION_COUNTER: std::sync::OnceLock<Counter> = std::sync::OnceLock::new();
@@ -44,6 +45,23 @@ pub fn inc_worker_job_dropped_metric() {
     worker_job_dropped_counter().inc();
 }
 
+static DROPPED_LOGS_COUNTER: std::sync::OnceLock<Counter> = std::sync::OnceLock::new();
+
+/// `dropped_logs_total` — counts logs dropped due to buffer backpressure in the log aggregator.
+pub fn dropped_logs_counter() -> &'static Counter {
+    DROPPED_LOGS_COUNTER.get_or_init(|| {
+        Counter::new(
+            "dropped_logs_total",
+            "Total log entries dropped due to buffer backpressure in log aggregator",
+        )
+        .unwrap()
+    })
+}
+
+pub fn inc_dropped_logs_metric() {
+    dropped_logs_counter().inc();
+}
+
 impl MetricsService {
     pub fn new() -> Self {
         let registry = Registry::new();
@@ -51,16 +69,19 @@ impl MetricsService {
         let volume = Counter::new("business_volume_total", "Total business volume").unwrap();
         let pool_exhaustion = pool_exhaustion_counter().clone();
         let worker_job_dropped = worker_job_dropped_counter().clone();
+        let dropped_logs = dropped_logs_counter().clone();
         registry.register(Box::new(active_users.clone())).unwrap();
         registry.register(Box::new(volume.clone())).unwrap();
         let _ = registry.register(Box::new(pool_exhaustion.clone()));
         let _ = registry.register(Box::new(worker_job_dropped.clone()));
+        let _ = registry.register(Box::new(dropped_logs.clone()));
         Self {
             registry,
             active_users,
             volume,
             pool_exhaustion,
             worker_job_dropped,
+            dropped_logs,
         }
     }
 }
@@ -70,6 +91,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
     let registry = Registry::new();
     let _ = registry.register(Box::new(pool_exhaustion_counter().clone()));
     let _ = registry.register(Box::new(worker_job_dropped_counter().clone()));
+    let _ = registry.register(Box::new(dropped_logs_counter().clone()));
 
     // Read the actual memory stats
     let (rss, _heap) = crate::services::sys_metrics::get_linux_memory_stats();
@@ -97,6 +119,14 @@ mod worker_job_dropped_tests {
         let before = worker_job_dropped_counter().get();
         inc_worker_job_dropped_metric();
         let after = worker_job_dropped_counter().get();
+        assert_eq!(after, before + 1.0);
+    }
+
+    #[test]
+    fn inc_dropped_logs_metric_increments_the_counter() {
+        let before = dropped_logs_counter().get();
+        inc_dropped_logs_metric();
+        let after = dropped_logs_counter().get();
         assert_eq!(after, before + 1.0);
     }
 }

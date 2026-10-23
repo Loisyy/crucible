@@ -92,6 +92,130 @@ pub struct MetricsSummary {
     pub total_metrics: i64,
     pub categories: std::collections::HashMap<String, i64>,
     pub latest_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cumulative_transactions: u128,
+    #[serde(default)]
+    pub cumulative_stroop_fees: u128,
+    #[serde(default)]
+    #[schema(value_type = f64)]
+    pub cumulative_volume: Decimal,
+}
+
+impl Default for MetricsSummary {
+    fn default() -> Self {
+        Self {
+            total_metrics: 0,
+            categories: HashMap::new(),
+            latest_timestamp: None,
+            cumulative_transactions: 0,
+            cumulative_stroop_fees: 0,
+            cumulative_volume: Decimal::ZERO,
+        }
+    }
+}
+
+/// Cumulative metric counter that tracks aggregated volumes, transaction counts,
+/// and stroop fees using checked and saturating arithmetic to prevent integer overflow
+/// on long-running production environments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CumulativeMetricsAccumulator {
+    /// Cumulative count of executed transactions (saturates at u128::MAX).
+    pub cumulative_transactions: u128,
+    /// Cumulative stroop fees paid across networks (saturates at u128::MAX).
+    pub cumulative_stroop_fees: u128,
+    /// Cumulative monetary volume (Decimal checked addition, saturates at Decimal::MAX).
+    #[schema(value_type = f64)]
+    pub cumulative_volume: Decimal,
+    /// Cumulative operational costs (Decimal checked addition, saturates at Decimal::MAX).
+    #[schema(value_type = f64)]
+    pub cumulative_cost: Decimal,
+}
+
+impl Default for CumulativeMetricsAccumulator {
+    fn default() -> Self {
+        Self {
+            cumulative_transactions: 0,
+            cumulative_stroop_fees: 0,
+            cumulative_volume: Decimal::ZERO,
+            cumulative_cost: Decimal::ZERO,
+        }
+    }
+}
+
+impl CumulativeMetricsAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Safely accumulate transaction count using saturating addition.
+    pub fn add_transactions(&mut self, count: u64) {
+        self.cumulative_transactions = self.cumulative_transactions.saturating_add(count as u128);
+    }
+
+    /// Safely accumulate transaction count from u128 using saturating addition.
+    pub fn add_transactions_u128(&mut self, count: u128) {
+        self.cumulative_transactions = self.cumulative_transactions.saturating_add(count);
+    }
+
+    /// Safely accumulate stroop fees using saturating addition.
+    pub fn add_stroop_fees(&mut self, stroops: u64) {
+        self.cumulative_stroop_fees = self.cumulative_stroop_fees.saturating_add(stroops as u128);
+    }
+
+    /// Safely accumulate stroop fees from u128 using saturating addition.
+    pub fn add_stroop_fees_u128(&mut self, stroops: u128) {
+        self.cumulative_stroop_fees = self.cumulative_stroop_fees.saturating_add(stroops);
+    }
+
+    /// Safely accumulate volume using checked addition, saturating at Decimal::MAX on overflow.
+    pub fn add_volume(&mut self, volume: Decimal) {
+        self.cumulative_volume = self.cumulative_volume.checked_add(volume).unwrap_or(Decimal::MAX);
+    }
+
+    /// Safely accumulate costs using checked addition, saturating at Decimal::MAX on overflow.
+    pub fn add_cost(&mut self, cost: Decimal) {
+        self.cumulative_cost = self.cumulative_cost.checked_add(cost).unwrap_or(Decimal::MAX);
+    }
+
+    /// Ingest a business metric and safely update cumulative accumulators.
+    pub fn ingest_metric(&mut self, metric: &BusinessMetric) {
+        match metric.category {
+            MetricCategory::Transactions => {
+                if let Ok(count) = metric.value.to_string().parse::<u64>() {
+                    self.add_transactions(count);
+                } else if metric.value > Decimal::ZERO {
+                    self.cumulative_transactions = u128::MAX;
+                }
+            }
+            MetricCategory::Revenue => {
+                self.add_volume(metric.value);
+            }
+            MetricCategory::Costs => {
+                self.add_cost(metric.value);
+                let unit_lower = metric.unit.to_lowercase();
+                if unit_lower == "stroop" || unit_lower == "stroops" {
+                    if let Ok(stroops) = metric.value.to_string().parse::<u64>() {
+                        self.add_stroop_fees(stroops);
+                    } else if metric.value > Decimal::ZERO {
+                        self.cumulative_stroop_fees = u128::MAX;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Create accumulator by ingesting an iterator of metrics.
+    pub fn from_metrics<'a, I>(metrics: I) -> Self
+    where
+        I: IntoIterator<Item = &'a BusinessMetric>,
+    {
+        let mut acc = Self::new();
+        for m in metrics {
+            acc.ingest_metric(m);
+        }
+        acc
+    }
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -358,10 +482,15 @@ impl BusinessMetricsService {
             categories.insert(cat_str, count);
         }
 
+        let cumulative = self.get_cumulative_metrics(None).await;
+
         Ok(MetricsSummary {
             total_metrics: total,
             categories,
             latest_timestamp: latest,
+            cumulative_transactions: cumulative.cumulative_transactions,
+            cumulative_stroop_fees: cumulative.cumulative_stroop_fees,
+            cumulative_volume: cumulative.cumulative_volume,
         })
     }
 
@@ -449,6 +578,26 @@ impl BusinessMetricsService {
     pub async fn get_cached_latest(&self, name: &str) -> Option<BusinessMetric> {
         let cache = self.cache.read().await;
         cache.get(name)?.last().cloned()
+    }
+
+    /// Calculate cumulative business metrics from the in-memory cache without overflow risk.
+    pub async fn get_cumulative_metrics(&self, name: Option<&str>) -> CumulativeMetricsAccumulator {
+        let cache = self.cache.read().await;
+        let mut acc = CumulativeMetricsAccumulator::new();
+        if let Some(n) = name {
+            if let Some(list) = cache.get(n) {
+                for m in list {
+                    acc.ingest_metric(m);
+                }
+            }
+        } else {
+            for list in cache.values() {
+                for m in list {
+                    acc.ingest_metric(m);
+                }
+            }
+        }
+        acc
     }
 }
 
@@ -661,9 +810,13 @@ mod tests {
             total_metrics: 42,
             categories: HashMap::from([("revenue".to_string(), 10i64)]),
             latest_timestamp: Some(Utc::now()),
+            cumulative_transactions: 100,
+            cumulative_stroop_fees: 5000,
+            cumulative_volume: Decimal::new(25000, 2),
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("42"));
+        assert!(json.contains("cumulative_stroop_fees"));
     }
 
     #[test]
@@ -676,6 +829,86 @@ mod tests {
     #[test]
     fn test_metric_source_default() {
         let src = MetricSource::default();
-        assert_eq!(src, MetricSource::Database);
+        assert_eq!(src, MetricSource::Manual);
+    }
+
+    #[test]
+    fn test_cumulative_metrics_overflow_protection() {
+        let mut acc = CumulativeMetricsAccumulator::new();
+        // Saturating addition beyond u64::MAX
+        acc.add_transactions(u64::MAX);
+        acc.add_transactions(100);
+        assert_eq!(acc.cumulative_transactions, (u64::MAX as u128) + 100);
+
+        acc.add_stroop_fees(u64::MAX);
+        acc.add_stroop_fees(500);
+        assert_eq!(acc.cumulative_stroop_fees, (u64::MAX as u128) + 500);
+
+        // Saturating at u128::MAX
+        acc.add_transactions_u128(u128::MAX);
+        assert_eq!(acc.cumulative_transactions, u128::MAX);
+        acc.add_transactions(1);
+        assert_eq!(acc.cumulative_transactions, u128::MAX);
+
+        acc.add_stroop_fees_u128(u128::MAX);
+        assert_eq!(acc.cumulative_stroop_fees, u128::MAX);
+        acc.add_stroop_fees(10);
+        assert_eq!(acc.cumulative_stroop_fees, u128::MAX);
+    }
+
+    #[test]
+    fn test_cumulative_metrics_decimal_volume_checked_addition() {
+        let mut acc = CumulativeMetricsAccumulator::new();
+        acc.add_volume(Decimal::new(1000, 2));
+        acc.add_volume(Decimal::new(2000, 2));
+        assert_eq!(acc.cumulative_volume, Decimal::new(3000, 2));
+
+        // Saturate when adding past Decimal::MAX
+        acc.add_volume(Decimal::MAX);
+        assert_eq!(acc.cumulative_volume, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_cumulative_metrics_ingest_metrics() {
+        let mut acc = CumulativeMetricsAccumulator::new();
+        let m1 = BusinessMetric {
+            id: Uuid::new_v4(),
+            name: "revenue_event".to_string(),
+            value: Decimal::new(500, 0),
+            unit: "USD".to_string(),
+            category: MetricCategory::Revenue,
+            tags: HashMap::new(),
+            recorded_at: Utc::now(),
+            source: MetricSource::OnChain,
+        };
+        let m2 = BusinessMetric {
+            id: Uuid::new_v4(),
+            name: "gas_fee".to_string(),
+            value: Decimal::new(12345, 0),
+            unit: "stroop".to_string(),
+            category: MetricCategory::Costs,
+            tags: HashMap::new(),
+            recorded_at: Utc::now(),
+            source: MetricSource::OnChain,
+        };
+        let m3 = BusinessMetric {
+            id: Uuid::new_v4(),
+            name: "tx_count".to_string(),
+            value: Decimal::new(50, 0),
+            unit: "count".to_string(),
+            category: MetricCategory::Transactions,
+            tags: HashMap::new(),
+            recorded_at: Utc::now(),
+            source: MetricSource::Database,
+        };
+
+        acc.ingest_metric(&m1);
+        acc.ingest_metric(&m2);
+        acc.ingest_metric(&m3);
+
+        assert_eq!(acc.cumulative_volume, Decimal::new(500, 0));
+        assert_eq!(acc.cumulative_stroop_fees, 12345);
+        assert_eq!(acc.cumulative_transactions, 50);
+        assert_eq!(acc.cumulative_cost, Decimal::new(12345, 0));
     }
 }

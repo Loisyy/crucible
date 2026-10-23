@@ -53,6 +53,7 @@ use tracing::info_span;
         profiling::get_health,
         dashboard::get_dashboard_metrics,
         dashboard::get_contract_stats,
+        dashboard::get_batch_contract_stats,
         audit::list_audit_reports,
         audit::get_audit_report,
     ),
@@ -61,6 +62,8 @@ use tracing::info_span;
         profiling::HealthResponse,
         dashboard::DashboardMetrics,
         dashboard::ContractStats,
+        dashboard::BatchContractStatsRequest,
+        dashboard::BatchContractStatsResponse,
         audit::AuditEventRecord,
         audit::AuditEventRequest,
     )),
@@ -94,11 +97,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let _tracing_guard = TracingService::init(tracing_config)?;
     let _enter = info_span!("app.startup").entered();
 
-    let db_pool = config
-        .database
-        .to_sqlx_pool_options()
-        .connect(&config.database.url)
-        .await?;
+    let db_pool = config.database.create_pool().await?;
     tracing::info!("Database connection established");
 
     let redis_client = RedisClient::open(config.redis.url.clone())?;
@@ -109,11 +108,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let (log_aggregator, log_receiver) = LogAggregator::new();
     let log_aggregator = Arc::new(log_aggregator);
     let sandbox_service = Arc::new(ContractSandboxService::default());
-    let contract_benchmark_service = Arc::new(ContractBenchmarkService::new());
+    let contract_benchmark_service = Arc::new(ContractBenchmarkService::with_db(db_pool.clone()));
     let config_manager = Arc::new(ConfigManager::new(config.clone()));
 
-    tokio::spawn(MetricsExporter::run_collector(metrics_exporter.clone()));
-    tokio::spawn(LogAggregator::run_worker(log_receiver));
+    let shutdown_coordinator = Arc::new(backend::workers::ShutdownCoordinator::new());
+
+    let collector_handle = tokio::spawn(MetricsExporter::run_collector(metrics_exporter.clone()));
+    let aggregator_handle = tokio::spawn(LogAggregator::run_worker(log_receiver));
+    shutdown_coordinator.register(collector_handle).await;
+    shutdown_coordinator.register(aggregator_handle).await;
 
     let conn = backend::db::redis::connect_with_retry(&redis_client, &config.redis).await?;
     // A job's lease/heartbeat window: if the worker holding a job stops
@@ -131,6 +134,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let worker = WorkerBuilder::new("monitor-worker")
         .backend(storage)
         .build_fn(monitor_transaction);
+
+    let worker_handle = tokio::spawn(async move {
+        let _ = worker.run().await;
+    });
+    shutdown_coordinator.register(worker_handle).await;
 
     let health_cache = backend::db::redis::connect_with_retry(&redis_client, &config.redis).await?;
     let health_queue = backend::db::redis::connect_with_retry(&redis_client, &config.redis).await?;
@@ -166,15 +174,17 @@ async fn main() -> Result<(), anyhow::Error> {
     tracing::info!("Crucible backend listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    let result = tokio::select! {
-        res = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
-            db_pool.close().await;
-            res
-        },
-        _ = worker.run() => Ok(()),
-    };
+    let res = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    let worker_grace_period = std::time::Duration::from_secs(config.server.worker_grace_period_secs);
+    tracing::info!(
+        "Server stopping; waiting for background workers to drain (grace period: {}s)...",
+        config.server.worker_grace_period_secs
+    );
+    shutdown_coordinator.shutdown_with_grace(worker_grace_period).await;
+    tracing::info!("Closing database connection pool");
+    db_pool.close().await;
 
-    result?;
+    res?;
     Ok(())
 }
 

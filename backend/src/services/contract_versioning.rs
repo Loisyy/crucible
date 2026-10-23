@@ -409,6 +409,11 @@ Build failed in deterministic container.
         }
     }
 
+    /// Compare two version strings per SemVer 2.0.0 rules, ignoring build metadata for precedence.
+    pub fn compare_versions(&self, a: &str, b: &str) -> Option<std::cmp::Ordering> {
+        compare_semver(a, b)
+    }
+
     /// Verifies that uploaded source code deterministically compiles to match on-chain Wasm hash.
     /// Simulates/executes reproducible build container with `cargo build --target wasm32-unknown-unknown --release`.
     pub async fn verify_contract_source(
@@ -576,16 +581,124 @@ fn validate_version_request(request: &CreateContractVersionRequest) -> Result<()
     Ok(())
 }
 
-fn is_semver(version: &str) -> bool {
-    let parts: Vec<_> = version.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSemVer {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub pre_release: Option<String>,
+    pub build_metadata: Option<String>,
 }
 
-fn major_version(version: &str) -> Option<u64> {
-    version.split('.').next()?.parse().ok()
+impl ParsedSemVer {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        // Split build metadata after '+'
+        let (without_build, build_metadata) = match s.split_once('+') {
+            Some((wb, build)) => {
+                if build.is_empty() || !build.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                    return None;
+                }
+                (wb, Some(build.to_string()))
+            }
+            None => (s, None),
+        };
+
+        // Split pre-release after '-'
+        let (core, pre_release) = match without_build.split_once('-') {
+            Some((c, pre)) => {
+                if pre.is_empty() || !pre.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-') {
+                    return None;
+                }
+                (c, Some(pre.to_string()))
+            }
+            None => (without_build, None),
+        };
+
+        let parts: Vec<&str> = core.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+
+        let major: u64 = parts[0].parse().ok()?;
+        let minor: u64 = parts[1].parse().ok()?;
+        let patch: u64 = parts[2].parse().ok()?;
+
+        // Reject leading zeros in numeric identifiers if length > 1
+        for p in &parts {
+            if p.len() > 1 && p.starts_with('0') {
+                return None;
+            }
+        }
+
+        Some(ParsedSemVer {
+            major,
+            minor,
+            patch,
+            pre_release,
+            build_metadata,
+        })
+    }
+
+    /// Compare version precedence according to SemVer 2.0.0.
+    /// Build metadata MUST be ignored when determining version precedence.
+    pub fn cmp_precedence(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.major.cmp(&other.major), self.minor.cmp(&other.minor), self.patch.cmp(&other.patch)) {
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {
+                match (&self.pre_release, &other.pre_release) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(a), Some(b)) => compare_prerelease(a, b),
+                }
+            }
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal, ord) => ord,
+            (std::cmp::Ordering::Equal, ord, _) => ord,
+            (ord, _, _) => ord,
+        }
+    }
+}
+
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_parts: Vec<&str> = a.split('.').collect();
+    let b_parts: Vec<&str> = b.split('.').collect();
+
+    for (p_a, p_b) in a_parts.iter().zip(b_parts.iter()) {
+        let is_a_num = p_a.chars().all(|c| c.is_ascii_digit());
+        let is_b_num = p_b.chars().all(|c| c.is_ascii_digit());
+
+        match (is_a_num, is_b_num) {
+            (true, true) => {
+                let n_a: u64 = p_a.parse().unwrap_or(0);
+                let n_b: u64 = p_b.parse().unwrap_or(0);
+                if n_a != n_b {
+                    return n_a.cmp(&n_b);
+                }
+            }
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {
+                if p_a != p_b {
+                    return p_a.cmp(p_b);
+                }
+            }
+        }
+    }
+    a_parts.len().cmp(&b_parts.len())
+}
+
+pub fn compare_semver(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let v_a = ParsedSemVer::parse(a)?;
+    let v_b = ParsedSemVer::parse(b)?;
+    Some(v_a.cmp_precedence(&v_b))
+}
+
+pub fn is_semver(version: &str) -> bool {
+    ParsedSemVer::parse(version).is_some()
+}
+
+pub fn major_version(version: &str) -> Option<u64> {
+    ParsedSemVer::parse(version).map(|v| v.major)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -774,5 +887,65 @@ mod tests {
         assert!(summary.exported_functions.contains(&"get_count".to_string()));
         assert!(summary.imported_functions.contains(&"env.call".to_string()));
         assert!(summary.decompiled_preview.contains("pub struct Contract;"));
+    }
+
+    #[test]
+    fn test_semver_build_metadata_ignored_in_precedence() {
+        // SemVer 2.0.0 Section 10: Build metadata MUST be ignored when determining version precedence
+        assert_eq!(
+            compare_semver("1.0.0+build.1", "1.0.0+build.2"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_semver("1.0.0+20130313144700", "1.0.0"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-beta+exp.sha.5114f85", "1.0.0-beta+exp.sha.9999999"),
+            Some(std::cmp::Ordering::Equal)
+        );
+
+        // Precedence comparisons
+        assert_eq!(
+            compare_semver("1.0.0", "1.0.0-alpha"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-alpha", "1.0.0-alpha.1"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-alpha.1", "1.0.0-alpha.beta"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-beta", "1.0.0-beta.2"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-beta.2", "1.0.0-beta.11"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-beta.11", "1.0.0-rc.1"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver("1.0.0-rc.1", "1.0.0"),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn test_is_semver_supports_build_metadata_and_prerelease() {
+        assert!(is_semver("1.2.3"));
+        assert!(is_semver("1.2.3-alpha.1"));
+        assert!(is_semver("1.2.3+build.123"));
+        assert!(is_semver("1.2.3-beta.2+build.sha.abc1234"));
+
+        assert!(!is_semver("1.2"));
+        assert!(!is_semver("01.2.3"));
+        assert!(!is_semver("v1.2.3"));
+        assert!(!is_semver("invalid"));
     }
 }

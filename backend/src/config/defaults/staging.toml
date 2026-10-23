@@ -6,7 +6,7 @@ max_connections = 5000
 [database]
 max_connections = 50
 min_connections = 5
-connect_timeout_secs = 10
+connect_timeout_secs = 3
 idle_timeout_secs = 300
 
 [redis]
